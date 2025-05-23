@@ -7,28 +7,22 @@ edition = "2021"
 needletail = "0.6.3"
 nthash = "0.5.1"
 minimizer-iter = "1.2.1"
-simd-minimizers = "1.0"
+simd-minimizers = "1.1"
 fxhash = "0.2.1"
 flate2 = "1.0.25"
-zstd = "0.11.2"
+zstd = "0.13"
 rayon = "1.5"
-packed-seq = "1.0"
+packed-seq = "2.0"
 crossbeam-channel = "0.5"
-ahash="0.8.11"
+ahash = "0.8.11"
 seq_io = "0.3"
-seq_io_parallel = "0.1"
+seq_io_parallel = "0.2"
 niffler = "3.0"
-
-
-[build]
-rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+avx2,+fma"]
-
-
 
 [profile.dev]
 opt-level = 3
-debug = false          # remove debug info
-lto = "fat"            # use fat Link-Time Optimization
-codegen-units = 1      # fewer codegen units for better optimization
-panic = "abort"        # use abort to reduce overhead
-incremental = false 
+debug = false       # remove debug info
+lto = "fat"         # use fat Link-Time Optimization
+codegen-units = 1   # fewer codegen units for better optimization
+panic = "abort"     # use abort to reduce overhead
+incremental = false
