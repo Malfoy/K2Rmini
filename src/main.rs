@@ -4,16 +4,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
-use crossbeam_channel::unbounded;
-use seq_io::fasta::Reader as FastaReader;
-use nthash::nthash;
-use flate2::read::MultiGzDecoder;
-use zstd::stream::read::Decoder as ZstdDecoder;
 use ahash::AHashSet;
-use simd_minimizers::minimizer_positions;
+use crossbeam_channel::unbounded;
+use flate2::read::MultiGzDecoder;
+use nthash::nthash;
 use packed_seq::{PackedSeqVec, Seq, SeqVec};
+use seq_io::fasta::Reader as FastaReader;
 use seq_io::fasta::Record;
-
+use zstd::stream::read::Decoder as ZstdDecoder;
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -32,11 +30,21 @@ fn main() -> io::Result<()> {
 
     eprintln!("Indexing reference k-mers...");
     let ref_kmer_dict = Arc::new(index_reference_kmers(reference_path, kmer_size)?);
-    eprintln!("Reference k-mer index contains {} entries.", ref_kmer_dict.len());
+    eprintln!(
+        "Reference k-mer index contains {} entries.",
+        ref_kmer_dict.len()
+    );
 
     eprintln!("Indexing reference minimizers...");
-    let ref_min_dict = Arc::new(index_reference_minimizers(reference_path, minimizer_size, window_size)?);
-    eprintln!("Reference minimizer index contains {} entries.", ref_min_dict.len());
+    let ref_min_dict = Arc::new(index_reference_minimizers(
+        reference_path,
+        minimizer_size,
+        window_size,
+    )?);
+    eprintln!(
+        "Reference minimizer index contains {} entries.",
+        ref_min_dict.len()
+    );
 
     eprintln!("Processing query sequences using a producer–consumer model...");
     process_query_streaming(
@@ -53,7 +61,10 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn index_reference_kmers<P: AsRef<Path>>(ref_path: P, kmer_size: usize) -> io::Result<AHashSet<u64>> {
+fn index_reference_kmers<P: AsRef<Path>>(
+    ref_path: P,
+    kmer_size: usize,
+) -> io::Result<AHashSet<u64>> {
     let mut dict = AHashSet::new();
     let file = File::open(ref_path)?;
     let mut reader = FastaReader::new(BufReader::new(file));
@@ -68,7 +79,11 @@ fn index_reference_kmers<P: AsRef<Path>>(ref_path: P, kmer_size: usize) -> io::R
     Ok(dict)
 }
 
-fn index_reference_minimizers<P: AsRef<Path>>(ref_path: P, minimizer_size: usize, window_size: usize) -> io::Result<AHashSet<u64>> {
+fn index_reference_minimizers<P: AsRef<Path>>(
+    ref_path: P,
+    minimizer_size: usize,
+    window_size: usize,
+) -> io::Result<AHashSet<u64>> {
     let mut dict = AHashSet::new();
     let file = File::open(ref_path)?;
     let mut reader = FastaReader::new(BufReader::new(file));
@@ -88,15 +103,15 @@ fn index_reference_minimizers<P: AsRef<Path>>(ref_path: P, minimizer_size: usize
         );
         for pos in fwd_pos {
             if (pos as usize + minimizer_size) <= seq.len() {
-                let shard = packed_seq.slice((pos as usize)..(pos as usize + minimizer_size)).to_word();
+                let shard = packed_seq
+                    .slice((pos as usize)..(pos as usize + minimizer_size))
+                    .to_word();
                 dict.insert(shard as u64);
             }
         }
     }
     Ok(dict)
 }
-
-
 
 fn process_query_streaming<P: AsRef<Path>>(
     query_path: P,
@@ -129,7 +144,9 @@ fn process_query_streaming<P: AsRef<Path>>(
         }
     });
 
-    let num_consumers = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let num_consumers = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     let mut consumer_handles = Vec::with_capacity(num_consumers);
 
     for _ in 0..num_consumers {
@@ -140,7 +157,6 @@ fn process_query_streaming<P: AsRef<Path>>(
 
         let handle = thread::spawn(move || {
             while let Ok((id, seq)) = record_rx_clone.recv() {
-                
                 // Compute minimizers for the query sequence using simd-minimizers.
                 let packed_seq = PackedSeqVec::from_ascii(&seq);
                 let mut fwd_pos = Vec::new();
@@ -154,7 +170,9 @@ fn process_query_streaming<P: AsRef<Path>>(
                 let mut shared_min_count = 0;
                 for pos in &fwd_pos {
                     if (*pos as usize + minimizer_size) <= seq.len() {
-                        let minimizer = packed_seq.slice((*pos as usize)..(*pos as usize + minimizer_size)).to_word();
+                        let minimizer = packed_seq
+                            .slice((*pos as usize)..(*pos as usize + minimizer_size))
+                            .to_word();
                         if ref_min_dict_clone.contains(&(minimizer as u64)) {
                             shared_min_count += 1;
                         }
@@ -197,13 +215,14 @@ fn process_query_streaming<P: AsRef<Path>>(
     Ok(())
 }
 
-
-
-
 fn open_compressed_file<P: AsRef<Path>>(path: P) -> io::Result<Box<dyn Read + Send>> {
     let file = File::open(&path)?;
     let buf_reader = BufReader::new(file);
-    let extension = path.as_ref().extension().and_then(|s| s.to_str()).unwrap_or("");
+    let extension = path
+        .as_ref()
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
     match extension {
         "gz" => Ok(Box::new(MultiGzDecoder::new(buf_reader))),
         "zst" => Ok(Box::new(ZstdDecoder::new(buf_reader)?)),
