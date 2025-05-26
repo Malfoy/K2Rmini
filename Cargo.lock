@@ -11,6 +11,7 @@ dependencies = [
  "crossbeam-channel",
  "flate2",
  "fxhash",
+ "libc",
  "memory-stats",
  "minimizer-iter",
  "needletail",
@@ -18,6 +19,7 @@ dependencies = [
  "nthash",
  "packed-seq",
  "rayon",
+ "rustc-hash",
  "seq_io",
  "seq_io_parallel",
  "simd-minimizers",
@@ -531,8 +533,7 @@ checksum = "a4895175b425cb1f87721b59f0f286c2092bd4af812243672510e1ac53e2e0ad"
 [[package]]
 name = "packed-seq"
 version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28884cb8a1678a01bd92eec6e39ef44537ebb30b53aceaab98f4931ee70b42bf"
+source = "git+https://github.com/rust-seq/packed-seq.git#8d0a91f8d206a4df91ff23845a59002447e1e5e5"
 dependencies = [
  "cfg-if",
  "mem_dbg",
@@ -661,6 +662,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustc-hash"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "357703d41365b4b27c590e3ed91eabb1b663f07c4c084095e60cbed4362dff0d"
+
+[[package]]
 name = "safe_arch"
 version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -736,8 +743,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 [[package]]
 name = "simd-minimizers"
 version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f92df1a883c10e5d04b0cf137795aa3db1bb1a686f3cb5da9ff49440b8490062"
+source = "git+https://github.com/rust-seq/simd-minimizers.git#078083e8e1f4dbb50ecaf5af8b56a492c72f4bd3"
 dependencies = [
  "itertools",
  "packed-seq",
