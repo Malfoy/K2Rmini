@@ -22,6 +22,7 @@ niffler = "3.0"
 memory-stats = "1.2"
 rustc-hash = "2.1"
 libc = "0.2"
+regex = "1.11"
 
 [profile.release]
 opt-level = 3
