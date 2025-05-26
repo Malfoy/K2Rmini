@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::thread;
 
 use ahash::AHashSet;
+use clap::Parser;
 use crossbeam_channel::unbounded;
 use flate2::read::MultiGzDecoder;
 use nthash::nthash;
@@ -13,20 +14,40 @@ use seq_io::fasta::Reader as FastaReader;
 use seq_io::fasta::Record;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
-fn main() -> io::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() != 8 {
-        eprintln!("Usage: {} <reference.fasta> <query.fasta/q> <kmer_size> <minimizer_size> <window_size> <minimizer_threshold> <kmer_threshold>", args[0]);
-        std::process::exit(1);
-    }
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Reference file (FASTA, possibly compressed)
+    #[arg(short, long)]
+    reference: String,
+    /// File to query (FASTA, possibly compressed)
+    #[arg(short, long)]
+    query: String,
+    /// K-mer size
+    #[arg(short, default_value_t = 31)]
+    k: usize,
+    /// Minimizer size
+    #[arg(short, default_value_t = 21)]
+    m: usize,
+    /// K-mer threshold
+    #[arg(short, default_value_t = 1000)]
+    threshold: usize,
+    /// Number of threads [default: all]
+    #[arg(short = 'T', long)]
+    threads: Option<usize>,
+}
 
-    let reference_path = &args[1];
-    let query_path = &args[2];
-    let kmer_size: usize = args[3].parse().expect("Invalid kmer_size");
-    let minimizer_size: usize = args[4].parse().expect("Invalid minimizer_size");
-    let window_size: usize = args[5].parse().expect("Invalid window_size");
-    let minimizer_threshold: usize = args[6].parse().expect("Invalid minimizer_threshold");
-    let kmer_threshold: usize = args[7].parse().expect("Invalid kmer_threshold");
+fn main() -> io::Result<()> {
+    let args = Args::parse();
+
+    let reference_path = &args.reference;
+    let query_path = &args.query;
+    let kmer_size: usize = args.k;
+    let minimizer_size: usize = args.m;
+    assert!(minimizer_size <= kmer_size);
+    let window_size: usize = kmer_size - minimizer_size + 1;
+    let kmer_threshold: usize = args.threshold;
+    let minimizer_threshold: usize = kmer_threshold.div_ceil(window_size);
 
     eprintln!("Indexing reference k-mers...");
     let ref_kmer_dict = Arc::new(index_reference_kmers(reference_path, kmer_size)?);
@@ -70,7 +91,7 @@ fn index_reference_kmers<P: AsRef<Path>>(
     let mut reader = FastaReader::new(BufReader::new(file));
 
     while let Some(result) = reader.next() {
-        let record = result.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let record = result.map_err(io::Error::other)?;
         let seq = record.seq();
         for hash in nthash(seq, kmer_size) {
             dict.insert(hash);
@@ -89,7 +110,7 @@ fn index_reference_minimizers<P: AsRef<Path>>(
     let mut reader = FastaReader::new(BufReader::new(file));
 
     while let Some(result) = reader.next() {
-        let record = result.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let record = result.map_err(io::Error::other)?;
         let seq = record.seq();
         // Pack the sequence for simd-minimizers
         let packed_seq = PackedSeqVec::from_ascii(seq);
