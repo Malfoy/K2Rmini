@@ -1,5 +1,6 @@
+use std::fmt::Display;
 use std::io::{self, Write};
-use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::thread;
@@ -29,24 +30,53 @@ static MATCH_N: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 
+#[derive(Debug, Clone, Copy)]
+enum Threshold {
+    Absolute(usize),
+    Relative(f64),
+}
+
+impl FromStr for Threshold {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Ok(val) = s.parse::<usize>() {
+            Ok(Threshold::Absolute(val))
+        } else if let Ok(val) = s.parse::<f64>() {
+            Ok(Threshold::Relative(val))
+        } else {
+            Err(format!("Invalid threshold format: {}", s))
+        }
+    }
+}
+
+impl Display for Threshold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Threshold::Absolute(x) => write!(f, "{}", x),
+            Threshold::Relative(x) => write!(f, "{}", x),
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Reference file (FASTA, possibly compressed)
-    #[arg(short, long)]
+    /// Reference file (FASTA/Q, possibly compressed)
+    #[arg(short)]
     reference: String,
-    /// File to query (FASTA, possibly compressed)
-    #[arg(short, long)]
-    query: String,
+    /// File to filter (FASTA/Q, possibly compressed)
+    #[arg(short)]
+    file_to_filter: String,
     /// K-mer size
     #[arg(short, default_value_t = 31)]
     k: usize,
     /// Minimizer size
     #[arg(short, default_value_t = 21)]
     m: usize,
-    /// K-mer threshold
-    #[arg(short, default_value_t = 1000)]
-    threshold: usize,
+    /// K-mer threshold, either absolute (int) or relative (float)
+    #[arg(short, long, default_value_t = Threshold::Relative(0.5))]
+    threshold: Threshold,
     /// Number of threads [default: all]
     #[arg(short = 'T', long)]
     threads: Option<usize>,
@@ -69,16 +99,11 @@ fn mem_usage_gb() -> f64 {
 
 fn main() -> io::Result<()> {
     let args = Args::parse();
-    let reference_path = &args.reference;
-    let query_path = &args.query;
-    let kmer_size: usize = args.k;
-    let minimizer_size: usize = args.m;
-    assert!(minimizer_size <= kmer_size);
-    let kmer_threshold: usize = args.threshold;
+    assert!(args.m <= args.k);
 
     eprintln!("Indexing reference k-mers and minimizers...");
     let start = Instant::now();
-    let (min_dict, kmer_dict) = index_reference(reference_path, kmer_size, minimizer_size)?;
+    let (min_dict, kmer_dict) = index_reference(&args)?;
     eprintln!(
         "Took {:.02} s, RAM: {:.03} GB",
         start.elapsed().as_secs_f64(),
@@ -97,14 +122,7 @@ fn main() -> io::Result<()> {
 
     eprintln!("Processing query sequences using a producer-consumer model...");
     let start = Instant::now();
-    process_query_streaming(
-        query_path,
-        kmer_size,
-        minimizer_size,
-        kmer_threshold,
-        Arc::clone(&ref_kmer_dict),
-        Arc::clone(&ref_min_dict),
-    )?;
+    process_query_streaming(&args, Arc::clone(&ref_kmer_dict), Arc::clone(&ref_min_dict))?;
     eprintln!(
         "Took {:.02} s, RAM: {:.03} GB",
         start.elapsed().as_secs_f64(),
@@ -114,13 +132,11 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn index_reference<P: AsRef<Path>>(
-    ref_path: P,
-    kmer_size: usize,
-    minimizer_size: usize,
-) -> io::Result<(MinIndex, KmerIndex)> {
+fn index_reference(args: &Args) -> io::Result<(MinIndex, KmerIndex)> {
+    let kmer_size: usize = args.k;
+    let minimizer_size: usize = args.m;
     let window_size: usize = kmer_size - minimizer_size + 1;
-    let mut reader = parse_fastx_file(ref_path).expect("Failed to parse reference file");
+    let mut reader = parse_fastx_file(&args.reference).expect("Failed to parse reference file");
     let mut dict_mini = MinIndex::default();
     let mut dict_kmer = KmerIndex::default();
     let mut mini_pos = Vec::new();
@@ -172,18 +188,17 @@ fn index_reference<P: AsRef<Path>>(
     Ok((dict_mini, dict_kmer))
 }
 
-fn process_query_streaming<P: AsRef<Path>>(
-    query_path: P,
-    kmer_size: usize,
-    minimizer_size: usize,
-    kmer_threshold: usize,
+fn process_query_streaming(
+    args: &Args,
     ref_kmer_dict: Arc<KmerIndex>,
     ref_min_dict: Arc<MinIndex>,
 ) -> io::Result<()> {
+    let kmer_size: usize = args.k;
+    let minimizer_size: usize = args.m;
     let window_size: usize = kmer_size - minimizer_size + 1;
-    let minimizer_threshold: usize = kmer_threshold.div_ceil(window_size);
+    let threshold = args.threshold;
 
-    let mut parser = parse_fastx_file(query_path).expect("Failed to parse query file");
+    let mut parser = parse_fastx_file(&args.file_to_filter).expect("Failed to parse query file");
     let (record_tx, record_rx) = unbounded();
     let (result_tx, result_rx) = unbounded();
 
@@ -202,9 +217,11 @@ fn process_query_streaming<P: AsRef<Path>>(
         }
     });
 
-    let num_consumers = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    let num_consumers = args.threads.unwrap_or(
+        thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4),
+    );
     let mut consumer_handles = Vec::with_capacity(num_consumers);
 
     for _ in 0..num_consumers {
@@ -217,6 +234,14 @@ fn process_query_streaming<P: AsRef<Path>>(
             let mut mini_pos = Vec::new();
             let mut kmer_hashes = Vec::new();
             while let Ok((id, seq)) = record_rx_clone.recv() {
+                let kmer_threshold: usize = match threshold {
+                    Threshold::Absolute(n) => n,
+                    Threshold::Relative(f) => {
+                        (((seq.len().saturating_sub(kmer_size) + 1) as f64) * f).ceil() as usize
+                    }
+                };
+                let minimizer_threshold: usize = kmer_threshold.div_ceil(window_size);
+
                 let mut shared_min_count = 0;
                 let seqs: Vec<_> = MATCH_N
                     .split(&seq)
