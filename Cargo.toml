@@ -4,25 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-packed-seq = { git = "https://github.com/rust-seq/packed-seq.git" }
 clap = { version = "4.5", features = ["derive"] }
-needletail = "0.6"
-nthash = "0.5"
-minimizer-iter = "1.2"
-simd-minimizers = { git = "https://github.com/rust-seq/simd-minimizers.git" }
-fxhash = "0.2"
-flate2 = "1.0"
-zstd = "0.13"
-rayon = "1.5"
 crossbeam-channel = "0.5"
-ahash = "0.8"
-seq_io = "0.3"
-seq_io_parallel = "0.2"
-niffler = "3.0"
-memory-stats = "1.2"
-rustc-hash = "2.1"
 libc = "0.2"
+needletail = "0.6"
+packed-seq = { git = "https://github.com/rust-seq/packed-seq.git" }
+simd-minimizers = { git = "https://github.com/rust-seq/simd-minimizers.git" }
 regex = "1.11"
+rustc-hash = "2.1"
 
 [profile.release]
 opt-level = 3
