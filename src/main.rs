@@ -1,3 +1,5 @@
+use std::array::from_fn;
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -10,16 +12,21 @@ use crossbeam_channel::unbounded;
 use needletail::parse_fastx_file;
 use packed_seq::{PackedSeq, PackedSeqVec, Seq, SeqVec};
 use regex::bytes::{Regex, RegexBuilder};
-use rustc_hash::FxHashSet;
-use simd_minimizers::minimizer_positions;
+use rustc_hash::FxBuildHasher;
+use simd_minimizers::minimizer_and_superkmer_positions;
 use simd_minimizers::private::collect::collect_into;
 use simd_minimizers::private::nthash::{nthash_seq_scalar, nthash_seq_simd, NtHasher};
-use simd_minimizers::scalar::minimizer_positions_scalar;
+use simd_minimizers::scalar::minimizer_and_superkmer_positions_scalar;
 
-type MinIndex = FxHashSet<usize>;
-type KmerIndex = FxHashSet<u32>;
+type MinIndex = HashSet<usize, FxBuildHasher>;
+type Bucket = HashSet<u32, FxBuildHasher>;
+type KmerIndex = [Bucket; SHARDS];
 
 const SIMD_LEN_THRESHOLD: usize = 1000;
+const SHARD_BITS: usize = 9;
+const SHARDS: usize = 1 << SHARD_BITS;
+const SHARD_MASK: usize = SHARDS - 1;
+const BUCKET_CAP: usize = (8 << 20) / (SHARDS * u32::BITS as usize);
 
 static MATCH_N: LazyLock<Regex> = LazyLock::new(|| {
     RegexBuilder::new(r"[N]+")
@@ -88,7 +95,7 @@ fn main() -> io::Result<()> {
     let ref_kmer_dict = Arc::new(kmer_dict);
     eprintln!(
         "Reference k-mer index contains {} entries.",
-        ref_kmer_dict.len()
+        ref_kmer_dict.iter().map(|b| b.len()).sum::<usize>()
     );
     eprintln!(
         "Reference minimizer index contains {} entries.",
@@ -122,8 +129,10 @@ fn index_reference<P: AsRef<Path>>(
     let window_size: usize = kmer_size - minimizer_size + 1;
     let mut reader = parse_fastx_file(ref_path).expect("Failed to parse reference file");
     let mut dict_mini = MinIndex::default();
-    let mut dict_kmer = KmerIndex::default();
+    let mut dict_kmer = from_fn(|_| Bucket::with_capacity_and_hasher(BUCKET_CAP, FxBuildHasher));
+    let mut sk_pos = Vec::new();
     let mut mini_pos = Vec::new();
+    let mut mini_words = Vec::new();
     let mut kmer_hashes = Vec::new();
 
     while let Some(result) = reader.next() {
@@ -133,15 +142,18 @@ fn index_reference<P: AsRef<Path>>(
             .split(seq)
             .filter(|&seq| seq.len() >= kmer_size)
             .for_each(|seq| {
-                let packed_seq = PackedSeqVec::from_ascii(seq);
+                sk_pos.clear();
                 mini_pos.clear();
+                mini_words.clear();
                 kmer_hashes.clear();
+                let packed_seq = PackedSeqVec::from_ascii(seq);
                 if seq.len() >= kmer_size + SIMD_LEN_THRESHOLD {
-                    minimizer_positions(
+                    minimizer_and_superkmer_positions(
                         packed_seq.as_slice(),
                         minimizer_size,
                         window_size,
                         &mut mini_pos,
+                        &mut sk_pos,
                     );
                     let nthash_iter = nthash_seq_simd::<false, PackedSeq, NtHasher>(
                         packed_seq.as_slice(),
@@ -150,23 +162,34 @@ fn index_reference<P: AsRef<Path>>(
                     );
                     collect_into(nthash_iter, &mut kmer_hashes);
                 } else {
-                    minimizer_positions_scalar(
+                    minimizer_and_superkmer_positions_scalar(
                         packed_seq.as_slice(),
                         minimizer_size,
                         window_size,
                         &mut mini_pos,
+                        &mut sk_pos,
                     );
                     let nthash_iter =
                         nthash_seq_scalar::<false, NtHasher>(packed_seq.as_slice(), kmer_size);
                     kmer_hashes.extend(nthash_iter);
                 }
-                let mini_iter = mini_pos.iter().copied().map(|pos| {
+                mini_words.extend(mini_pos.iter().copied().map(|pos| {
                     packed_seq
                         .slice((pos as usize)..(pos as usize + minimizer_size))
                         .to_word()
-                });
-                dict_mini.extend(mini_iter);
-                dict_kmer.extend(&kmer_hashes);
+                }));
+                dict_mini.extend(&mini_words);
+                let mut sk_start = 0;
+                sk_pos.push(kmer_hashes.len() as u32);
+                for (sk_end, mini) in sk_pos
+                    .iter()
+                    .copied()
+                    .skip(1)
+                    .zip(mini_words.iter().copied())
+                {
+                    dict_kmer[mini & SHARD_MASK].extend(&kmer_hashes[sk_start..sk_end as usize]);
+                    sk_start = sk_end as usize;
+                }
             });
     }
     Ok((dict_mini, dict_kmer))
@@ -214,51 +237,66 @@ fn process_query_streaming<P: AsRef<Path>>(
         let ref_kmer_dict_clone = Arc::clone(&ref_kmer_dict);
 
         let handle = thread::spawn(move || {
+            let mut sk_pos = Vec::new();
             let mut mini_pos = Vec::new();
+            let mut mini_words = Vec::new();
             let mut kmer_hashes = Vec::new();
+            let mut offsets = Vec::new();
+            let mut seqs = Vec::new();
             while let Ok((id, seq)) = record_rx_clone.recv() {
+                sk_pos.clear();
+                mini_words.clear();
+                offsets.clear();
+                seqs.clear();
                 let mut shared_min_count = 0;
-                let seqs: Vec<_> = MATCH_N
+                MATCH_N
                     .split(&seq)
                     .filter(|&seq| seq.len() >= kmer_size)
-                    .map(|seq| {
+                    .for_each(|seq| {
+                        let offset = sk_pos.len();
+                        offsets.push(offset);
                         let packed_seq = PackedSeqVec::from_ascii(seq);
                         mini_pos.clear();
                         if seq.len() >= kmer_size + SIMD_LEN_THRESHOLD {
-                            minimizer_positions(
+                            minimizer_and_superkmer_positions(
                                 packed_seq.as_slice(),
                                 minimizer_size,
                                 window_size,
                                 &mut mini_pos,
+                                &mut sk_pos,
                             );
                         } else {
-                            minimizer_positions_scalar(
+                            minimizer_and_superkmer_positions_scalar(
                                 packed_seq.as_slice(),
                                 minimizer_size,
                                 window_size,
                                 &mut mini_pos,
+                                &mut sk_pos,
                             );
                         }
-                        shared_min_count += mini_pos
+                        mini_words.extend(mini_pos.iter().copied().skip(offset).map(|pos| {
+                            packed_seq
+                                .slice((pos as usize)..(pos as usize + minimizer_size))
+                                .to_word()
+                        }));
+                        shared_min_count += mini_words
                             .iter()
                             .copied()
-                            .map(|pos| {
-                                packed_seq
-                                    .slice((pos as usize)..(pos as usize + minimizer_size))
-                                    .to_word()
-                            })
+                            .skip(offset)
                             .filter(|word| ref_min_dict_clone.contains(word))
                             .count();
-                        packed_seq
-                    })
-                    .collect();
+                        seqs.push(packed_seq);
+                    });
 
                 if shared_min_count < minimizer_threshold {
                     continue;
                 }
 
+                let mut off_start = 0;
+                offsets.push(sk_pos.len());
+                sk_pos.push(0);
                 let mut kmer_match_count = 0;
-                for packed_seq in seqs {
+                for (off_end, packed_seq) in offsets.iter().copied().skip(1).zip(seqs.iter()) {
                     kmer_hashes.clear();
                     let nthash_iter = nthash_seq_simd::<false, PackedSeq, NtHasher>(
                         packed_seq.as_slice(),
@@ -266,11 +304,22 @@ fn process_query_streaming<P: AsRef<Path>>(
                         1,
                     );
                     collect_into(nthash_iter, &mut kmer_hashes);
-                    kmer_match_count += kmer_hashes
+
+                    let mut sk_start = 0;
+                    sk_pos[off_end] = kmer_hashes.len() as u32;
+                    for (sk_end, mini) in sk_pos[(off_start + 1)..=off_end]
                         .iter()
                         .copied()
-                        .filter(|hash| ref_kmer_dict_clone.contains(hash))
-                        .count();
+                        .zip(mini_words[off_start..off_end].iter().copied())
+                    {
+                        kmer_match_count += kmer_hashes[sk_start..sk_end as usize]
+                            .iter()
+                            .copied()
+                            .filter(|hash| ref_kmer_dict_clone[mini & SHARD_MASK].contains(hash))
+                            .count();
+                        sk_start = sk_end as usize;
+                    }
+                    off_start = off_end;
                 }
 
                 if kmer_match_count >= kmer_threshold {
