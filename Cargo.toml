@@ -12,6 +12,7 @@ packed-seq = { git = "https://github.com/rust-seq/packed-seq.git" }
 simd-minimizers = { git = "https://github.com/rust-seq/simd-minimizers.git" }
 regex = "1.11"
 rustc-hash = "2.1"
+sux = "0.7"
 
 [profile.release]
 opt-level = 3

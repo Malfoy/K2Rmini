@@ -15,8 +15,9 @@ use simd_minimizers::minimizer_positions;
 use simd_minimizers::private::collect::collect_into;
 use simd_minimizers::private::nthash::{nthash_seq_scalar, nthash_seq_simd, NtHasher};
 use simd_minimizers::scalar::minimizer_positions_scalar;
+use sux::bits::{bit_vec, BitVec};
 
-type MinIndex = FxHashSet<usize>;
+type MinIndex = BitVec;
 type KmerIndex = FxHashSet<u32>;
 
 const SIMD_LEN_THRESHOLD: usize = 1000;
@@ -42,7 +43,7 @@ struct Args {
     #[arg(short, default_value_t = 31)]
     k: usize,
     /// Minimizer size
-    #[arg(short, default_value_t = 21)]
+    #[arg(short, default_value_t = 13)]
     m: usize,
     /// K-mer threshold
     #[arg(short, default_value_t = 1000)]
@@ -121,7 +122,7 @@ fn index_reference<P: AsRef<Path>>(
 ) -> io::Result<(MinIndex, KmerIndex)> {
     let window_size: usize = kmer_size - minimizer_size + 1;
     let mut reader = parse_fastx_file(ref_path).expect("Failed to parse reference file");
-    let mut dict_mini = MinIndex::default();
+    let mut dict_mini = bit_vec![false; 1 << (2 * minimizer_size)];
     let mut dict_kmer = KmerIndex::default();
     let mut mini_pos = Vec::new();
     let mut kmer_hashes = Vec::new();
@@ -165,7 +166,7 @@ fn index_reference<P: AsRef<Path>>(
                         .slice((pos as usize)..(pos as usize + minimizer_size))
                         .to_word()
                 });
-                dict_mini.extend(mini_iter);
+                mini_iter.for_each(|mini| dict_mini.set(mini, true));
                 dict_kmer.extend(&kmer_hashes);
             });
     }
@@ -247,7 +248,7 @@ fn process_query_streaming<P: AsRef<Path>>(
                                     .slice((pos as usize)..(pos as usize + minimizer_size))
                                     .to_word()
                             })
-                            .filter(|word| ref_min_dict_clone.contains(word))
+                            .filter(|&word| ref_min_dict_clone.get(word))
                             .count();
                         packed_seq
                     })
