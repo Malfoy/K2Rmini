@@ -41,11 +41,19 @@ impl FromStr for Threshold {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if let Ok(val) = s.parse::<usize>() {
-            Ok(Threshold::Absolute(val))
+            if val == 0 {
+                Err("Absolute threshold must be ≥1".to_string())
+            } else {
+                Ok(Threshold::Absolute(val))
+            }
         } else if let Ok(val) = s.parse::<f64>() {
-            Ok(Threshold::Relative(val))
+            if !val.is_sign_positive() || val == 0. || val > 1. {
+                Err("Relative threshold must in (0, 1]".to_string())
+            } else {
+                Ok(Threshold::Relative(val))
+            }
         } else {
-            Err(format!("Invalid threshold format: {}", s))
+            Err("Invalid threshold format, pass an int or a float".to_string())
         }
     }
 }
@@ -62,12 +70,12 @@ impl Display for Threshold {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Reference file (FASTA/Q, possibly compressed)
+    /// FASTA/Q file containing k-mers of interest (possibly compressed)
     #[arg(short)]
-    reference: String,
-    /// File to filter (FASTA/Q, possibly compressed)
-    #[arg(short)]
-    file_to_filter: String,
+    patterns: String,
+    /// FASTA/Q file to filter (possibly compressed)
+    #[arg()]
+    file: String,
     /// K-mer size
     #[arg(short, default_value_t = 31)]
     k: usize,
@@ -99,9 +107,19 @@ fn mem_usage_gb() -> f64 {
 
 fn main() -> io::Result<()> {
     let args = Args::parse();
-    assert!(args.m <= args.k);
+    assert!(args.m <= args.k, "Minimizer size must be ≤ k");
+    eprintln!(
+        "Running with k={}, m={} and {} threshold of {}",
+        args.k,
+        args.m,
+        match args.threshold {
+            Threshold::Absolute(_) => "an absolute",
+            Threshold::Relative(_) => "a relative",
+        },
+        args.threshold
+    );
 
-    eprintln!("Indexing reference k-mers and minimizers...");
+    eprintln!("Indexing k-mers and minimizers of interest...");
     let start = Instant::now();
     let (min_dict, kmer_dict) = index_reference(&args)?;
     eprintln!(
@@ -112,15 +130,12 @@ fn main() -> io::Result<()> {
     let ref_min_dict = Arc::new(min_dict);
     let ref_kmer_dict = Arc::new(kmer_dict);
     eprintln!(
-        "Reference k-mer index contains {} entries.",
-        ref_kmer_dict.len()
-    );
-    eprintln!(
-        "Reference minimizer index contains {} entries.",
+        "Indexed {} k-mers and {} minimizers.",
+        ref_kmer_dict.len(),
         ref_min_dict.len()
     );
 
-    eprintln!("Processing query sequences using a producer-consumer model...");
+    eprintln!("Filtering sequences in parallel...");
     let start = Instant::now();
     process_query_streaming(&args, Arc::clone(&ref_kmer_dict), Arc::clone(&ref_min_dict))?;
     eprintln!(
@@ -136,7 +151,8 @@ fn index_reference(args: &Args) -> io::Result<(MinIndex, KmerIndex)> {
     let kmer_size: usize = args.k;
     let minimizer_size: usize = args.m;
     let window_size: usize = kmer_size - minimizer_size + 1;
-    let mut reader = parse_fastx_file(&args.reference).expect("Failed to parse reference file");
+    let mut reader =
+        parse_fastx_file(&args.patterns).expect("Failed to parse file containing patterns");
     let mut dict_mini = MinIndex::default();
     let mut dict_kmer = KmerIndex::default();
     let mut mini_pos = Vec::new();
@@ -198,7 +214,7 @@ fn process_query_streaming(
     let window_size: usize = kmer_size - minimizer_size + 1;
     let threshold = args.threshold;
 
-    let mut parser = parse_fastx_file(&args.file_to_filter).expect("Failed to parse query file");
+    let mut parser = parse_fastx_file(&args.file).expect("Failed to parse file to filter");
     let (record_tx, record_rx) = unbounded();
     let (result_tx, result_rx) = unbounded();
 
