@@ -42,12 +42,12 @@ impl FromStr for Threshold {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if let Ok(val) = s.parse::<usize>() {
             if val == 0 {
-                Err("Absolute threshold must be ≥1".to_string())
+                Err("Absolute threshold must be ≥ 1".to_string())
             } else {
                 Ok(Threshold::Absolute(val))
             }
         } else if let Ok(val) = s.parse::<f64>() {
-            if !val.is_sign_positive() || val == 0. || val > 1. {
+            if val.is_nan() || val.is_sign_negative() || val == 0. || val > 1. {
                 Err("Relative threshold must in (0, 1]".to_string())
             } else {
                 Ok(Threshold::Relative(val))
