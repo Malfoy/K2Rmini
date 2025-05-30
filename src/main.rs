@@ -22,7 +22,7 @@ type MinIndex = FxHashSet<usize>;
 type KmerIndex = FxHashSet<u32>;
 
 const SIMD_LEN_THRESHOLD: usize = 1000; // SIMD is slower for short seqs
-const MSG_LEN_THRESHOLD: usize = 1 << 13; // small enough for long reads
+const MSG_LEN_THRESHOLD: usize = 8000; // small enough for long reads
 
 static MATCH_N: LazyLock<Regex> = LazyLock::new(|| {
     RegexBuilder::new(r"[N]+")
@@ -378,7 +378,7 @@ fn process_query_streaming(
                     for ((id_end, seq_end), packed_end) in ends.iter().copied().zip(packed_ends) {
                         let id = &ids[id_start..id_end];
                         let seq = &seqs[seq_start..seq_end];
-                        let kmer_end = packed_end - kmer_size + 1;
+                        let kmer_last = packed_end - kmer_size + 1;
 
                         let kmer_threshold: usize = match threshold {
                             Threshold::Absolute(n) => n,
@@ -390,10 +390,7 @@ fn process_query_streaming(
                         let minimizer_threshold: usize = kmer_threshold.div_ceil(window_size);
 
                         let mut shared_min_count = 0;
-                        while sk_pos[mini_idx] < packed_start as u32 {
-                            mini_idx += 1;
-                        }
-                        while mini_idx < sk_pos.len() && sk_pos[mini_idx] < kmer_end as u32 {
+                        while mini_idx < sk_pos.len() && sk_pos[mini_idx] < kmer_last as u32 {
                             let pos = mini_pos[mini_idx] as usize;
                             let word = packed_seqs.slice(pos..(pos + minimizer_size)).to_word();
                             shared_min_count += if ref_min_dict_clone.contains(&word) {
@@ -403,12 +400,20 @@ fn process_query_streaming(
                             };
                             mini_idx += 1;
                         }
+                        while mini_idx + 1 < sk_pos.len()
+                            && sk_pos[mini_idx + 1] <= packed_end as u32
+                        {
+                            mini_idx += 1;
+                        }
 
                         if shared_min_count < minimizer_threshold {
+                            id_start = id_end;
+                            seq_start = seq_end;
+                            packed_start = packed_end;
                             continue;
                         }
 
-                        let kmer_match_count = kmer_hashes[packed_start..kmer_end]
+                        let kmer_match_count = kmer_hashes[packed_start..kmer_last]
                             .iter()
                             .copied()
                             .filter(|hash| ref_kmer_dict_clone.contains(hash))
@@ -436,19 +441,19 @@ fn process_query_streaming(
             let file = File::create(out).expect("Failed to open output file");
             let mut writer = BufWriter::new(file);
             for (id, seq) in result_rx.iter() {
-                writer.write_all(b">");
+                writer.write_all(b">").unwrap();
                 writer.write_all(&id).unwrap();
-                writer.write_all(b"\n");
+                writer.write_all(b"\n").unwrap();
                 writer.write_all(&seq).unwrap();
-                writer.write_all(b"\n");
+                writer.write_all(b"\n").unwrap();
             }
         } else {
             for (id, seq) in result_rx.iter() {
-                print!(">");
+                stdout().write_all(b">").unwrap();
                 stdout().write_all(&id).unwrap();
-                println!();
+                stdout().write_all(b"\n").unwrap();
                 stdout().write_all(&seq).unwrap();
-                println!();
+                stdout().write_all(b"\n").unwrap();
             }
         }
     });
