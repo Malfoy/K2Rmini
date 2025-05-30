@@ -1,26 +1,28 @@
-use std::fmt::Display;
-use std::io::{self, Write};
-use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::LazyLock;
+use core::fmt::Display;
+use core::mem::swap;
+use core::str::FromStr;
+use std::fs::File;
+use std::io::{self, stdout, BufWriter, Write};
+use std::sync::{Arc, LazyLock};
 use std::thread;
 use std::time::Instant;
 
 use clap::Parser;
-use crossbeam_channel::unbounded;
+use crossbeam_channel::bounded;
 use needletail::parse_fastx_file;
 use packed_seq::{PackedSeq, PackedSeqVec, Seq, SeqVec};
 use regex::bytes::{Regex, RegexBuilder};
 use rustc_hash::FxHashSet;
-use simd_minimizers::minimizer_positions;
 use simd_minimizers::private::collect::collect_into;
 use simd_minimizers::private::nthash::{nthash_seq_scalar, nthash_seq_simd, NtHasher};
 use simd_minimizers::scalar::minimizer_positions_scalar;
+use simd_minimizers::{minimizer_and_superkmer_positions, minimizer_positions};
 
 type MinIndex = FxHashSet<usize>;
 type KmerIndex = FxHashSet<u32>;
 
-const SIMD_LEN_THRESHOLD: usize = 1000;
+const SIMD_LEN_THRESHOLD: usize = 1000; // SIMD is slower for short seqs
+const MSG_LEN_THRESHOLD: usize = 1 << 13; // small enough for long reads
 
 static MATCH_N: LazyLock<Regex> = LazyLock::new(|| {
     RegexBuilder::new(r"[N]+")
@@ -76,6 +78,9 @@ struct Args {
     /// FASTA/Q file to filter (possibly compressed)
     #[arg()]
     file: String,
+    /// Output file for filtered sequences [default: stdout]
+    #[arg(short)]
+    output: Option<String>,
     /// K-mer size
     #[arg(short, default_value_t = 31)]
     k: usize,
@@ -213,33 +218,53 @@ fn process_query_streaming(
     let minimizer_size: usize = args.m;
     let window_size: usize = kmer_size - minimizer_size + 1;
     let threshold = args.threshold;
-
-    let mut parser = parse_fastx_file(&args.file).expect("Failed to parse file to filter");
-    let (record_tx, record_rx) = unbounded();
-    let (result_tx, result_rx) = unbounded();
-
-    let producer_handle = thread::spawn(move || {
-        while let Some(result) = parser.next() {
-            match result {
-                Ok(record) => {
-                    let id = record.id().to_vec(); // BOF
-                    let seq = record.seq().to_vec(); // BOF
-                    if record_tx.send((id, seq)).is_err() {
-                        break;
-                    }
-                }
-                Err(e) => eprintln!("Error reading record: {}", e),
-            }
-        }
-    });
-
+    let output = args.output.clone();
     let num_consumers = args.threads.unwrap_or(
         thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4),
     );
-    let mut consumer_handles = Vec::with_capacity(num_consumers);
 
+    let mut parser = parse_fastx_file(&args.file).expect("Failed to parse file to filter");
+    let (record_tx, record_rx) = bounded(2 * num_consumers);
+    let (result_tx, result_rx) = bounded(4 * num_consumers);
+
+    let producer_handle = thread::spawn(move || {
+        let mut ids = Vec::new();
+        let mut seqs = Vec::new();
+        let mut ends = Vec::new();
+        while let Some(result) = parser.next() {
+            match result {
+                Ok(record) => {
+                    let id = record.id();
+                    let seq = &record.seq();
+                    if seq.len() < kmer_size {
+                        continue;
+                    }
+                    ids.extend_from_slice(id);
+                    seqs.extend_from_slice(seq);
+                    ends.push((ids.len(), seqs.len()));
+                    if seqs.len() >= MSG_LEN_THRESHOLD {
+                        let mut tmp_ids = Vec::new();
+                        let mut tmp_seqs = Vec::new();
+                        let mut tmp_ends = Vec::new();
+                        swap(&mut ids, &mut tmp_ids);
+                        swap(&mut seqs, &mut tmp_seqs);
+                        swap(&mut ends, &mut tmp_ends);
+                        if record_tx.send((tmp_ids, tmp_seqs, tmp_ends)).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error reading record: {}", e),
+            }
+        }
+        if !seqs.is_empty() {
+            record_tx.send((ids, seqs, ends)).unwrap();
+        }
+    });
+
+    let mut consumer_handles = Vec::with_capacity(num_consumers);
     for _ in 0..num_consumers {
         let record_rx_clone = record_rx.clone();
         let result_tx_clone = result_tx.clone();
@@ -247,59 +272,53 @@ fn process_query_streaming(
         let ref_kmer_dict_clone = Arc::clone(&ref_kmer_dict);
 
         let handle = thread::spawn(move || {
+            let mut sk_pos = Vec::new();
             let mut mini_pos = Vec::new();
             let mut kmer_hashes = Vec::new();
-            while let Ok((id, seq)) = record_rx_clone.recv() {
-                let kmer_threshold: usize = match threshold {
-                    Threshold::Absolute(n) => n,
-                    Threshold::Relative(f) => {
-                        (((seq.len().saturating_sub(kmer_size) + 1) as f64) * f).ceil() as usize
-                    }
-                };
-                let minimizer_threshold: usize = kmer_threshold.div_ceil(window_size);
+            while let Ok((ids, seqs, ends)) = record_rx_clone.recv() {
+                if ends.len() == 1 {
+                    // a single long seq
+                    let id = &ids;
+                    let seq = &seqs;
 
-                let mut shared_min_count = 0;
-                let seqs: Vec<_> = MATCH_N
-                    .split(&seq)
-                    .filter(|&seq| seq.len() >= kmer_size)
-                    .map(|seq| {
-                        let packed_seq = PackedSeqVec::from_ascii(seq);
-                        mini_pos.clear();
-                        if seq.len() >= kmer_size + SIMD_LEN_THRESHOLD {
-                            minimizer_positions(
-                                packed_seq.as_slice(),
-                                minimizer_size,
-                                window_size,
-                                &mut mini_pos,
-                            );
-                        } else {
-                            minimizer_positions_scalar(
-                                packed_seq.as_slice(),
-                                minimizer_size,
-                                window_size,
-                                &mut mini_pos,
-                            );
+                    let kmer_threshold: usize = match threshold {
+                        Threshold::Absolute(n) => n,
+                        Threshold::Relative(f) => {
+                            (((seq.len().saturating_sub(kmer_size) + 1) as f64) * f).ceil() as usize
                         }
-                        shared_min_count += mini_pos
-                            .iter()
-                            .copied()
-                            .map(|pos| {
-                                packed_seq
-                                    .slice((pos as usize)..(pos as usize + minimizer_size))
-                                    .to_word()
-                            })
-                            .filter(|word| ref_min_dict_clone.contains(word))
-                            .count();
-                        packed_seq
-                    })
-                    .collect();
+                    };
+                    let minimizer_threshold: usize = kmer_threshold.div_ceil(window_size);
 
-                if shared_min_count < minimizer_threshold {
-                    continue;
-                }
+                    let mut packed_seq = PackedSeqVec::default();
+                    MATCH_N
+                        .split(seq)
+                        .filter(|&seq| seq.len() >= kmer_size)
+                        .for_each(|seq| {
+                            packed_seq.push_ascii(seq);
+                        });
 
-                let mut kmer_match_count = 0;
-                for packed_seq in seqs {
+                    mini_pos.clear();
+                    minimizer_positions(
+                        packed_seq.as_slice(),
+                        minimizer_size,
+                        window_size,
+                        &mut mini_pos,
+                    );
+                    let shared_min_count = mini_pos
+                        .iter()
+                        .copied()
+                        .map(|pos| {
+                            packed_seq
+                                .slice((pos as usize)..(pos as usize + minimizer_size))
+                                .to_word()
+                        })
+                        .filter(|word| ref_min_dict_clone.contains(word))
+                        .count();
+
+                    if shared_min_count < minimizer_threshold {
+                        continue;
+                    }
+
                     kmer_hashes.clear();
                     let nthash_iter = nthash_seq_simd::<false, PackedSeq, NtHasher>(
                         packed_seq.as_slice(),
@@ -307,15 +326,102 @@ fn process_query_streaming(
                         1,
                     );
                     collect_into(nthash_iter, &mut kmer_hashes);
-                    kmer_match_count += kmer_hashes
+                    let kmer_match_count = kmer_hashes
                         .iter()
                         .copied()
                         .filter(|hash| ref_kmer_dict_clone.contains(hash))
                         .count();
-                }
 
-                if kmer_match_count >= kmer_threshold {
-                    let _ = result_tx_clone.send((id, seq));
+                    if kmer_match_count >= kmer_threshold {
+                        let _ = result_tx_clone.send((id.clone(), seq.clone()));
+                    }
+
+                    continue;
+                } else {
+                    // multiple short seqs
+                    let mut packed_seqs = PackedSeqVec::default();
+                    let mut packed_ends = Vec::with_capacity(ends.len());
+                    let mut seq_start = 0;
+                    for (_, seq_end) in ends.iter().copied() {
+                        let seq = &seqs[seq_start..seq_end];
+                        MATCH_N
+                            .split(seq)
+                            .filter(|&seq| seq.len() >= kmer_size)
+                            .for_each(|seq| {
+                                packed_seqs.push_ascii(seq);
+                            });
+                        packed_ends.push(packed_seqs.len());
+                        seq_start = seq_end;
+                    }
+
+                    sk_pos.clear();
+                    mini_pos.clear();
+                    minimizer_and_superkmer_positions(
+                        packed_seqs.as_slice(),
+                        minimizer_size,
+                        window_size,
+                        &mut mini_pos,
+                        &mut sk_pos,
+                    );
+                    kmer_hashes.clear();
+                    let nthash_iter = nthash_seq_simd::<false, PackedSeq, NtHasher>(
+                        packed_seqs.as_slice(),
+                        kmer_size,
+                        1,
+                    );
+                    collect_into(nthash_iter, &mut kmer_hashes);
+
+                    let mut id_start = 0;
+                    let mut seq_start = 0;
+                    let mut packed_start = 0;
+                    let mut mini_idx = 0;
+                    for ((id_end, seq_end), packed_end) in ends.iter().copied().zip(packed_ends) {
+                        let id = &ids[id_start..id_end];
+                        let seq = &seqs[seq_start..seq_end];
+                        let kmer_end = packed_end - kmer_size + 1;
+
+                        let kmer_threshold: usize = match threshold {
+                            Threshold::Absolute(n) => n,
+                            Threshold::Relative(f) => {
+                                (((seq.len().saturating_sub(kmer_size) + 1) as f64) * f).ceil()
+                                    as usize
+                            }
+                        };
+                        let minimizer_threshold: usize = kmer_threshold.div_ceil(window_size);
+
+                        let mut shared_min_count = 0;
+                        while sk_pos[mini_idx] < packed_start as u32 {
+                            mini_idx += 1;
+                        }
+                        while mini_idx < sk_pos.len() && sk_pos[mini_idx] < kmer_end as u32 {
+                            let pos = mini_pos[mini_idx] as usize;
+                            let word = packed_seqs.slice(pos..(pos + minimizer_size)).to_word();
+                            shared_min_count += if ref_min_dict_clone.contains(&word) {
+                                1
+                            } else {
+                                0
+                            };
+                            mini_idx += 1;
+                        }
+
+                        if shared_min_count < minimizer_threshold {
+                            continue;
+                        }
+
+                        let kmer_match_count = kmer_hashes[packed_start..kmer_end]
+                            .iter()
+                            .copied()
+                            .filter(|hash| ref_kmer_dict_clone.contains(hash))
+                            .count();
+
+                        if kmer_match_count >= kmer_threshold {
+                            let _ = result_tx_clone.send((id.to_vec(), seq.to_vec()));
+                        }
+
+                        id_start = id_end;
+                        seq_start = seq_end;
+                        packed_start = packed_end;
+                    }
                 }
             }
         });
@@ -326,12 +432,24 @@ fn process_query_streaming(
     drop(result_tx);
 
     let printer_handle = thread::spawn(move || {
-        for (id, seq) in result_rx.iter() {
-            print!(">");
-            std::io::stdout().write_all(&id).unwrap();
-            println!();
-            std::io::stdout().write_all(&seq).unwrap();
-            println!();
+        if let Some(out) = output {
+            let file = File::create(out).expect("Failed to open output file");
+            let mut writer = BufWriter::new(file);
+            for (id, seq) in result_rx.iter() {
+                writer.write_all(b">");
+                writer.write_all(&id).unwrap();
+                writer.write_all(b"\n");
+                writer.write_all(&seq).unwrap();
+                writer.write_all(b"\n");
+            }
+        } else {
+            for (id, seq) in result_rx.iter() {
+                print!(">");
+                stdout().write_all(&id).unwrap();
+                println!();
+                stdout().write_all(&seq).unwrap();
+                println!();
+            }
         }
     });
 
