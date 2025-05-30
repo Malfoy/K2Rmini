@@ -441,28 +441,29 @@ fn process_query_streaming(
             let file = File::create(out).expect("Failed to open output file");
             let mut writer = BufWriter::new(file);
             for (id, seq) in result_rx.iter() {
-                writer.write_all(b">").unwrap();
-                writer.write_all(&id).unwrap();
-                writer.write_all(b"\n").unwrap();
-                writer.write_all(&seq).unwrap();
-                writer.write_all(b"\n").unwrap();
+                writer.write_all(b">")?;
+                writer.write_all(&id)?;
+                writer.write_all(b"\n")?;
+                writer.write_all(&seq)?;
+                writer.write_all(b"\n")?;
             }
         } else {
             for (id, seq) in result_rx.iter() {
-                stdout().write_all(b">").unwrap();
-                stdout().write_all(&id).unwrap();
-                stdout().write_all(b"\n").unwrap();
-                stdout().write_all(&seq).unwrap();
-                stdout().write_all(b"\n").unwrap();
+                stdout().write_all(b">")?;
+                stdout().write_all(&id)?;
+                stdout().write_all(b"\n")?;
+                stdout().write_all(&seq)?;
+                stdout().write_all(b"\n")?;
             }
         }
+        io::Result::Ok(())
     });
 
     producer_handle.join().expect("Producer thread panicked");
     for handle in consumer_handles {
         handle.join().expect("Consumer thread panicked");
     }
-    printer_handle.join().expect("Printer thread panicked");
+    let _ = printer_handle.join().expect("Printer thread panicked");
 
     Ok(())
 }
