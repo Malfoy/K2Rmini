@@ -364,12 +364,6 @@ fn process_query_streaming(
                         &mut sk_pos,
                     );
                     kmer_hashes.clear();
-                    let nthash_iter = nthash_seq_simd::<false, PackedSeq, NtHasher>(
-                        packed_seqs.as_slice(),
-                        kmer_size,
-                        1,
-                    );
-                    collect_into(nthash_iter, &mut kmer_hashes);
 
                     let mut id_start = 0;
                     let mut seq_start = 0;
@@ -411,6 +405,15 @@ fn process_query_streaming(
                             seq_start = seq_end;
                             packed_start = packed_end;
                             continue;
+                        }
+
+                        if kmer_hashes.is_empty() {
+                            let nthash_iter = nthash_seq_simd::<false, PackedSeq, NtHasher>(
+                                packed_seqs.as_slice(),
+                                kmer_size,
+                                1,
+                            );
+                            collect_into(nthash_iter, &mut kmer_hashes);
                         }
 
                         let kmer_match_count = kmer_hashes[packed_start..kmer_last]
