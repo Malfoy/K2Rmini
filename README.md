@@ -40,7 +40,7 @@ Options:
 - a FASTA/Q file (flagged with `-p`) containing the *k*-mers of interest used for filtering: sequences containing enough of these *k*-mers will be outputed, while others will be discarded
 - a selection threshold (flagged with `-t`): a sequence is discarded if its number of desired *k*-mers is below this threshold, the threshold can be relative (e.g. at least 90% of desired *k*-mers) or absolute (e.g. at least 2 desired *k*-mers)
 
-It also provides options to write the output to a file (`-o`), set the the *k*-mer size (`-k`) or set the number of threads (`-T`).
+It also provides options to write the output to a file (`-o`), set the *k*-mer size (`-k`) or set the number of threads (`-T`).
 You shouldn't need to change the minimizer size (`-m`), excepted if `k` is smaller than 25.
 
 ### Example: selecting reads with ≥90% of desired *k*-mers
