@@ -3,14 +3,13 @@
 version = 4
 
 [[package]]
-name = "BTS2"
+name = "K2Rmini"
 version = "0.1.0"
 dependencies = [
  "clap",
  "crossbeam-channel",
  "libc",
  "needletail",
- "packed-seq",
  "regex",
  "rustc-hash",
  "simd-minimizers",
@@ -98,9 +97,9 @@ dependencies = [
 
 [[package]]
 name = "bytecount"
-version = "0.6.8"
+version = "0.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ce89b21cab1437276d2650d57e971f9d548a2d9037cc231abdc0562b97498ce"
+checksum = "175812e0be2bccb6abe50bb8d566126198344f707e304f45c648fd8f2cc0365e"
 
 [[package]]
 name = "bytemuck"
@@ -130,9 +129,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.24"
+version = "1.2.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16595d3be041c03b09d08d0858631facccee9221e579704070e6e9e4915d3bc7"
+checksum = "d0fc897dc1e865cc67c0e05a836d9d3f1df3cbe442aa4a9473b18e12624a4951"
 dependencies = [
  "jobserver",
  "libc",
@@ -360,7 +359,7 @@ checksum = "a4895175b425cb1f87721b59f0f286c2092bd4af812243672510e1ac53e2e0ad"
 [[package]]
 name = "packed-seq"
 version = "2.0.0"
-source = "git+https://github.com/rust-seq/packed-seq.git#485444dde9b6d00a8d3619a3b226ffcf67c99c67"
+source = "git+https://github.com/rust-seq/packed-seq#485444dde9b6d00a8d3619a3b226ffcf67c99c67"
 dependencies = [
  "cfg-if",
  "mem_dbg",
@@ -489,7 +488,7 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 [[package]]
 name = "simd-minimizers"
 version = "1.1.0"
-source = "git+https://github.com/rust-seq/simd-minimizers.git#078083e8e1f4dbb50ecaf5af8b56a492c72f4bd3"
+source = "git+https://github.com/rust-seq/simd-minimizers.git?rev=159e1d69e46c9fa5c28c48bc4a9f029fd5fbcb50#159e1d69e46c9fa5c28c48bc4a9f029fd5fbcb50"
 dependencies = [
  "itertools",
  "packed-seq",
