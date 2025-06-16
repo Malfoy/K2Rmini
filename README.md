@@ -26,13 +26,35 @@ Arguments:
 
 Options:
   -p <PATTERNS>                FASTA/Q file containing k-mers of interest (possibly compressed)
+  -t, --threshold <THRESHOLD>  K-mer threshold, either relative (float) or absolute (int) [default: 0.5]
   -o <OUTPUT>                  Output file for filtered sequences [default: stdout]
   -k <K>                       K-mer size [default: 31]
-  -m <M>                       Minimizer size [default: 21]
-  -t, --threshold <THRESHOLD>  K-mer threshold, either absolute (int) or relative (float) [default: 0.5]
+  -m <M>                       Minimizer size, must be ≤ k, up to 29 [default: 21]
   -T, --threads <THREADS>      Number of threads [default: all]
   -h, --help                   Print help
   -V, --version                Print version
+```
+
+`K2Rmini` has 3 main arguments:
+- a FASTA/Q file containing the sequences that you want to filter, this file can be compressed using `gzip` / `xz` / `zstd`
+- a FASTA/Q file (flagged with `-p`) containing the *k*-mers of interest used for filtering: sequences containing enough of these *k*-mers will be outputed, while others will be discarded
+- a selection threshold (flagged with `-t`): a sequence is discarded if its number of desired *k*-mers is below this threshold, the threshold can be relative (e.g. at least 90% of desired *k*-mers) or absolute (e.g. at least 2 desired *k*-mers)
+
+It also provides options to write the output to a file (`-o`), set the the *k*-mer size (`-k`) or set the number of threads (`-T`).
+You shouldn't need to change the minimizer size (`-m`), excepted if `k` is smaller than 25.
+
+### Example: selecting reads with ≥90% of desired *k*-mers
+
+Let's say we want to filter the reads in `reads.fa` to only keep those that share at least 90% of their *k*-mers with the reference in `reference.fa`, this can be achieved with:
+```sh
+K2Rmini -p reference.fa -t 0.9 reads.fa
+```
+
+### Example: selecting reads with ≥2 desired *k*-mers
+
+Let's say this time we have a list of *k*-mers of size 63 stored in `patterns.fa` and we want to select the reads in `reads.fa` that contain at least two of them, this can be achieved with:
+```sh
+K2Rmini -p patterns.fa -k 63 -t 2 reads.fa
 ```
 
 ## Citation
