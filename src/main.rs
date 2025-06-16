@@ -72,24 +72,24 @@ impl Display for Threshold {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// FASTA/Q file containing k-mers of interest (possibly compressed)
-    #[arg(short)]
-    patterns: String,
     /// FASTA/Q file to filter (possibly compressed)
     #[arg()]
     file: String,
+    /// FASTA/Q file containing k-mers of interest (possibly compressed)
+    #[arg(short)]
+    patterns: String,
+    /// K-mer threshold, either relative (float) or absolute (int)
+    #[arg(short, long, default_value_t = Threshold::Relative(0.5))]
+    threshold: Threshold,
     /// Output file for filtered sequences [default: stdout]
     #[arg(short)]
     output: Option<String>,
     /// K-mer size
     #[arg(short, default_value_t = 31)]
     k: usize,
-    /// Minimizer size
+    /// Minimizer size, must be ≤ k, up to 29
     #[arg(short, default_value_t = 21)]
     m: usize,
-    /// K-mer threshold, either absolute (int) or relative (float)
-    #[arg(short, long, default_value_t = Threshold::Relative(0.5))]
-    threshold: Threshold,
     /// Number of threads [default: all]
     #[arg(short = 'T', long)]
     threads: Option<usize>,
