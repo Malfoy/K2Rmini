@@ -8,7 +8,7 @@ clap = { version = "4.5", features = ["derive"] }
 crossbeam-channel = "0.5"
 libc = "0.2"
 needletail = "0.6"
-simd-minimizers = { git = "https://github.com/rust-seq/simd-minimizers.git", rev = "159e1d69e46c9fa5c28c48bc4a9f029fd5fbcb50" }
+simd-minimizers = "1.2"
 regex = "1.11"
 rustc-hash = "2.1"
 
