@@ -18,7 +18,7 @@ use simd_minimizers::private::nthash::{nthash_seq_scalar, nthash_seq_simd, NtHas
 use simd_minimizers::scalar::minimizer_positions_scalar;
 use simd_minimizers::{minimizer_and_superkmer_positions, minimizer_positions};
 
-type MinIndex = FxHashSet<usize>;
+type MinIndex = FxHashSet<u64>;
 type KmerIndex = FxHashSet<u32>;
 
 const SIMD_LEN_THRESHOLD: usize = 1000; // SIMD is slower for short seqs
@@ -200,7 +200,7 @@ fn index_reference(args: &Args) -> io::Result<(MinIndex, KmerIndex)> {
                 let mini_iter = mini_pos.iter().copied().map(|pos| {
                     packed_seq
                         .slice((pos as usize)..(pos as usize + minimizer_size))
-                        .to_word()
+                        .as_u64()
                 });
                 dict_mini.extend(mini_iter);
                 dict_kmer.extend(&kmer_hashes);
@@ -310,7 +310,7 @@ fn process_query_streaming(
                         .map(|pos| {
                             packed_seq
                                 .slice((pos as usize)..(pos as usize + minimizer_size))
-                                .to_word()
+                                .as_u64()
                         })
                         .filter(|word| ref_min_dict_clone.contains(word))
                         .count();
@@ -386,7 +386,7 @@ fn process_query_streaming(
                         let mut shared_min_count = 0;
                         while mini_idx < sk_pos.len() && sk_pos[mini_idx] < kmer_last as u32 {
                             let pos = mini_pos[mini_idx] as usize;
-                            let word = packed_seqs.slice(pos..(pos + minimizer_size)).to_word();
+                            let word = packed_seqs.slice(pos..(pos + minimizer_size)).as_u64();
                             shared_min_count += if ref_min_dict_clone.contains(&word) {
                                 1
                             } else {
