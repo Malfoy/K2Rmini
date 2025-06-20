@@ -2,7 +2,7 @@
 
 **K2Rmini** (or *K-mer to Reads* mini) is a tool to filter the reads contained in a FASTA/Q file based on a set of *k*-mers of interest.
 
-Under the hood, it uses [simd-minimizers](https://github.com/rust-seq/simd-minimizers) to quickly prefilter reads based on their minimizers, and filters the remaining candidates using the *k*-mer set. On an Apple M1, `K2Rmini` is able to filter long reads at 450Mbp/s.
+Under the hood, it uses [simd-minimizers](https://github.com/rust-seq/simd-minimizers) to quickly prefilter reads based on their minimizers, and filters the remaining candidates using the *k*-mer set. On an Apple M1, `K2Rmini` is able to filter long reads at >700 Mbp/s.
 
 ## Installation
 
