@@ -59,4 +59,4 @@ K2Rmini -p patterns.fa -k 63 -t 2 reads.fa
 
 ## Citation
 
-A preprint is coming soon.
+> Accelerating *k*-mer based sequence filtering. I. Martayan, L. Vandamme, B. Constantinides, B. Cazaux, C. Paperman and A. Limasset. https://doi.org/10.1101/2025.06.16.659853
