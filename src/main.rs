@@ -46,13 +46,13 @@ impl FromStr for Threshold {
             if val == 0 {
                 Err("Absolute threshold must be ≥ 1".to_string())
             } else {
-                Ok(Threshold::Absolute(val))
+                Ok(Self::Absolute(val))
             }
         } else if let Ok(val) = s.parse::<f64>() {
             if val.is_nan() || val.is_sign_negative() || val == 0. || val > 1. {
                 Err("Relative threshold must in (0, 1]".to_string())
             } else {
-                Ok(Threshold::Relative(val))
+                Ok(Self::Relative(val))
             }
         } else {
             Err("Invalid threshold format, pass an int or a float".to_string())
@@ -63,8 +63,8 @@ impl FromStr for Threshold {
 impl Display for Threshold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Threshold::Absolute(x) => write!(f, "{}", x),
-            Threshold::Relative(x) => write!(f, "{}", x),
+            Self::Absolute(x) => write!(f, "{x}"),
+            Self::Relative(x) => write!(f, "{x}"),
         }
     }
 }
@@ -219,11 +219,11 @@ fn process_query_streaming(
     let window_size: usize = kmer_size - minimizer_size + 1;
     let threshold = args.threshold;
     let output = args.output.clone();
-    let num_consumers = args.threads.unwrap_or(
+    let num_consumers = args.threads.unwrap_or_else(|| {
         thread::available_parallelism()
             .map(|n| n.get())
-            .unwrap_or(4),
-    );
+            .unwrap_or(4)
+    });
 
     let mut parser = parse_fastx_file(&args.file).expect("Failed to parse file to filter");
     let (record_tx, record_rx) = bounded(2 * num_consumers);
@@ -256,7 +256,7 @@ fn process_query_streaming(
                         }
                     }
                 }
-                Err(e) => eprintln!("Error reading record: {}", e),
+                Err(e) => eprintln!("Error reading record: {e}"),
             }
         }
         if !seqs.is_empty() {
