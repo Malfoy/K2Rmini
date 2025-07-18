@@ -286,7 +286,8 @@ fn process_query_streaming(
                         Threshold::Relative(f) => {
                             (((seq.len().saturating_sub(kmer_size) + 1) as f64) * f).ceil() as usize
                         }
-                    };
+                    }
+                    .min(ref_kmer_dict_clone.len());
                     let minimizer_threshold: usize = kmer_threshold.div_ceil(window_size);
 
                     let mut packed_seq = PackedSeqVec::default();
@@ -380,7 +381,8 @@ fn process_query_streaming(
                                 (((seq.len().saturating_sub(kmer_size) + 1) as f64) * f).ceil()
                                     as usize
                             }
-                        };
+                        }
+                        .min(ref_kmer_dict_clone.len());
                         let minimizer_threshold: usize = kmer_threshold.div_ceil(window_size);
 
                         let mut shared_min_count = 0;
