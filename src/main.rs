@@ -184,6 +184,7 @@ fn index_reference(args: &Args) -> io::Result<(MinIndex, KmerIndex)> {
                         packed_seq.as_slice(),
                         kmer_size,
                         1,
+                        None,
                     );
                     collect_into(nthash_iter, &mut kmer_hashes);
                 } else {
@@ -325,6 +326,7 @@ fn process_query_streaming(
                         packed_seq.as_slice(),
                         kmer_size,
                         1,
+                        None,
                     );
                     collect_into(nthash_iter, &mut kmer_hashes);
                     let kmer_match_count = kmer_hashes
@@ -414,6 +416,7 @@ fn process_query_streaming(
                                 packed_seqs.as_slice(),
                                 kmer_size,
                                 1,
+                                None,
                             );
                             collect_into(nthash_iter, &mut kmer_hashes);
                         }
