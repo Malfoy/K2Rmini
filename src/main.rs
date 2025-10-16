@@ -12,11 +12,9 @@ use crossbeam_channel::bounded;
 use needletail::parse_fastx_file;
 use regex::bytes::{Regex, RegexBuilder};
 use rustc_hash::FxHashSet;
-use simd_minimizers::packed_seq::{PackedSeq, PackedSeqVec, Seq, SeqVec};
-use simd_minimizers::private::collect::collect_into;
-use simd_minimizers::private::nthash::{nthash_seq_scalar, nthash_seq_simd, NtHasher};
-use simd_minimizers::scalar::minimizer_positions_scalar;
-use simd_minimizers::{minimizer_and_superkmer_positions, minimizer_positions};
+use simd_minimizers::minimizers;
+use simd_minimizers::packed_seq::{PackedSeqVec, Seq, SeqVec};
+use simd_minimizers::seq_hash::{KmerHasher, NtHasher};
 
 type MinIndex = FxHashSet<u64>;
 type KmerIndex = FxHashSet<u32>;
@@ -156,6 +154,8 @@ fn index_reference(args: &Args) -> io::Result<(MinIndex, KmerIndex)> {
     let kmer_size: usize = args.k;
     let minimizer_size: usize = args.m;
     let window_size: usize = kmer_size - minimizer_size + 1;
+    let mini_builder = minimizers(minimizer_size, window_size);
+    let hasher = NtHasher::<false>::new(kmer_size);
     let mut reader =
         parse_fastx_file(&args.patterns).expect("Failed to parse file containing patterns");
     let mut dict_mini = MinIndex::default();
@@ -174,29 +174,13 @@ fn index_reference(args: &Args) -> io::Result<(MinIndex, KmerIndex)> {
                 mini_pos.clear();
                 kmer_hashes.clear();
                 if seq.len() >= kmer_size + SIMD_LEN_THRESHOLD {
-                    minimizer_positions(
-                        packed_seq.as_slice(),
-                        minimizer_size,
-                        window_size,
-                        &mut mini_pos,
-                    );
-                    let nthash_iter = nthash_seq_simd::<false, PackedSeq, NtHasher>(
-                        packed_seq.as_slice(),
-                        kmer_size,
-                        1,
-                        None,
-                    );
-                    collect_into(nthash_iter, &mut kmer_hashes);
+                    mini_builder.run(packed_seq.as_slice(), &mut mini_pos);
+                    hasher
+                        .hash_kmers_simd(packed_seq.as_slice(), 1)
+                        .collect_into(&mut kmer_hashes);
                 } else {
-                    minimizer_positions_scalar(
-                        packed_seq.as_slice(),
-                        minimizer_size,
-                        window_size,
-                        &mut mini_pos,
-                    );
-                    let nthash_iter =
-                        nthash_seq_scalar::<false, NtHasher>(packed_seq.as_slice(), kmer_size);
-                    kmer_hashes.extend(nthash_iter);
+                    mini_builder.run_scalar(packed_seq.as_slice(), &mut mini_pos);
+                    kmer_hashes.extend(hasher.hash_kmers_scalar(packed_seq.as_slice()));
                 }
                 let mini_iter = mini_pos.iter().copied().map(|pos| {
                     packed_seq
@@ -207,6 +191,7 @@ fn index_reference(args: &Args) -> io::Result<(MinIndex, KmerIndex)> {
                 dict_kmer.extend(&kmer_hashes);
             });
     }
+    dict_mini.reserve(dict_mini.len() / 2);
     Ok((dict_mini, dict_kmer))
 }
 
@@ -273,6 +258,8 @@ fn process_query_streaming(
         let ref_kmer_dict_clone = Arc::clone(&ref_kmer_dict);
 
         let handle = thread::spawn(move || {
+            let mini_builder = minimizers(minimizer_size, window_size);
+            let hasher = NtHasher::<false>::new(kmer_size);
             let mut sk_pos = Vec::new();
             let mut mini_pos = Vec::new();
             let mut kmer_hashes = Vec::new();
@@ -300,12 +287,7 @@ fn process_query_streaming(
                         });
 
                     mini_pos.clear();
-                    minimizer_positions(
-                        packed_seq.as_slice(),
-                        minimizer_size,
-                        window_size,
-                        &mut mini_pos,
-                    );
+                    mini_builder.run(packed_seq.as_slice(), &mut mini_pos);
                     let shared_min_count = mini_pos
                         .iter()
                         .copied()
@@ -322,13 +304,9 @@ fn process_query_streaming(
                     }
 
                     kmer_hashes.clear();
-                    let nthash_iter = nthash_seq_simd::<false, PackedSeq, NtHasher>(
-                        packed_seq.as_slice(),
-                        kmer_size,
-                        1,
-                        None,
-                    );
-                    collect_into(nthash_iter, &mut kmer_hashes);
+                    hasher
+                        .hash_kmers_simd(packed_seq.as_slice(), 1)
+                        .collect_into(&mut kmer_hashes);
                     let kmer_match_count = kmer_hashes
                         .iter()
                         .copied()
@@ -359,13 +337,9 @@ fn process_query_streaming(
 
                     sk_pos.clear();
                     mini_pos.clear();
-                    minimizer_and_superkmer_positions(
-                        packed_seqs.as_slice(),
-                        minimizer_size,
-                        window_size,
-                        &mut mini_pos,
-                        &mut sk_pos,
-                    );
+                    mini_builder
+                        .super_kmers(&mut sk_pos)
+                        .run(packed_seqs.as_slice(), &mut mini_pos);
                     kmer_hashes.clear();
 
                     let mut id_start = 0;
@@ -412,13 +386,9 @@ fn process_query_streaming(
                         }
 
                         if kmer_hashes.is_empty() {
-                            let nthash_iter = nthash_seq_simd::<false, PackedSeq, NtHasher>(
-                                packed_seqs.as_slice(),
-                                kmer_size,
-                                1,
-                                None,
-                            );
-                            collect_into(nthash_iter, &mut kmer_hashes);
+                            hasher
+                                .hash_kmers_simd(packed_seqs.as_slice(), 1)
+                                .collect_into(&mut kmer_hashes);
                         }
 
                         let kmer_match_count = kmer_hashes[packed_start..kmer_last]
