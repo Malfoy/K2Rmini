@@ -13,14 +13,18 @@ use core::mem::swap;
 use core::str::FromStr;
 use std::fs::File;
 use std::io::{self, BufWriter, Write, stdout};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::Instant;
 
 type MinIndex = FxHashSet<u64>;
 type KmerIndex = FxHashSet<u32>;
+type IndexShards = Vec<Mutex<IndexShard>>;
+type FinalIndexShards = Vec<IndexShard>;
 
 const MSG_LEN_THRESHOLD: usize = 8000; // small enough for long reads
+const INDEX_BATCH_BASES: usize = 1 << 20;
+const INDEX_NUM_SHARDS: usize = 1 << 16;
 
 const CONFIG_INDEX: Config = ParserOptions::default()
     .ignore_headers()
@@ -36,6 +40,12 @@ static MATCH_N: LazyLock<Regex> = LazyLock::new(|| {
         .build()
         .unwrap()
 });
+
+#[derive(Default)]
+struct IndexShard {
+    mins: MinIndex,
+    kmers: KmerIndex,
+}
 
 #[derive(Debug, Clone, Copy)]
 enum Threshold {
@@ -131,23 +141,23 @@ fn main() -> io::Result<()> {
 
     eprintln!("Indexing k-mers and minimizers of interest...");
     let start = Instant::now();
-    let (min_dict, kmer_dict) = index_reference(&args)?;
+    let index_shards = index_reference(&args)?;
     eprintln!(
         "Took {:.02} s, RAM: {:.03} GB",
         start.elapsed().as_secs_f64(),
         mem_usage_gb()
     );
-    let ref_min_dict = Arc::new(min_dict);
-    let ref_kmer_dict = Arc::new(kmer_dict);
+    let ref_index_shards = Arc::new(index_shards);
+    let total_kmers: usize = ref_index_shards.iter().map(|s| s.kmers.len()).sum();
+    let total_minimizers: usize = ref_index_shards.iter().map(|s| s.mins.len()).sum();
     eprintln!(
-        "Indexed {} k-mers and {} minimizers.",
-        ref_kmer_dict.len(),
-        ref_min_dict.len()
+        "Indexed {} k-mers and {} minimizers across {} shards.",
+        total_kmers, total_minimizers, INDEX_NUM_SHARDS
     );
 
     eprintln!("Filtering sequences in parallel...");
     let start = Instant::now();
-    process_query_streaming(&args, Arc::clone(&ref_kmer_dict), Arc::clone(&ref_min_dict))?;
+    process_query_streaming(&args, Arc::clone(&ref_index_shards), total_kmers)?;
     eprintln!(
         "Took {:.02} s, RAM: {:.03} GB",
         start.elapsed().as_secs_f64(),
@@ -157,54 +167,160 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn index_reference(args: &Args) -> io::Result<(MinIndex, KmerIndex)> {
+fn default_threads(threads: Option<usize>) -> usize {
+    threads.unwrap_or_else(|| {
+        thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    })
+}
+
+#[inline(always)]
+fn minimizer_shard(minimizer: u64, shard_mask: usize) -> usize {
+    let mut x = minimizer;
+    // splitmix64 finalizer: fast and well-distributed for shard partitioning.
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    (x as usize) & shard_mask
+}
+
+fn index_reference(args: &Args) -> io::Result<FinalIndexShards> {
     let kmer_size: usize = args.k;
     let minimizer_size: usize = args.m;
     let window_size: usize = kmer_size - minimizer_size + 1;
-    let mini_builder = minimizers(minimizer_size, window_size);
-    let hasher = NtHasher::<false>::new(kmer_size);
-    let mut parser = FastxParser::<CONFIG_INDEX>::from_file_in_ram(&args.patterns)
-        .expect("Failed to parse file containing patterns");
-    let mut dict_mini = MinIndex::default();
-    let mut dict_kmer = KmerIndex::default();
-    let mut mini_pos = Vec::new();
-    let mut kmer_hashes = Vec::new();
+    let num_workers = default_threads(args.threads).max(1);
+    let num_shards = INDEX_NUM_SHARDS;
+    let shard_mask = num_shards - 1;
+    let pattern_path = args.patterns.clone();
 
-    while let Some(_) = parser.next() {
-        let packed_seq = parser.get_packed_seq();
-        mini_pos.clear();
-        kmer_hashes.clear();
-        mini_builder.run(packed_seq, &mut mini_pos);
-        hasher
-            .hash_kmers_simd(packed_seq, 1)
-            .collect_into(&mut kmer_hashes);
-        let mini_iter = mini_pos.iter().copied().map(|pos| {
-            packed_seq
-                .slice((pos as usize)..(pos as usize + minimizer_size))
-                .as_u64()
+    let shards: Arc<IndexShards> = Arc::new(
+        (0..num_shards)
+            .map(|_| Mutex::new(IndexShard::default()))
+            .collect(),
+    );
+
+    let (batch_tx, batch_rx) = bounded::<Vec<PackedSeqVec>>(2 * num_workers);
+    let producer_handle = thread::spawn(move || {
+        let mut parser = FastxParser::<CONFIG_INDEX>::from_file_in_ram(&pattern_path)
+            .expect("Failed to parse file containing patterns");
+        let mut batch = Vec::with_capacity(4096);
+        let mut batch_bases = 0usize;
+
+        while let Some(_) = parser.next() {
+            let packed_seq = parser.get_packed_seq();
+            if packed_seq.len() < kmer_size {
+                continue;
+            }
+
+            batch_bases += packed_seq.len();
+            batch.push(packed_seq.to_vec());
+
+            if batch_bases >= INDEX_BATCH_BASES {
+                if batch_tx.send(batch).is_err() {
+                    return;
+                }
+                batch = Vec::with_capacity(4096);
+                batch_bases = 0;
+            }
+        }
+
+        if !batch.is_empty() {
+            let _ = batch_tx.send(batch);
+        }
+    });
+
+    let mut worker_handles = Vec::with_capacity(num_workers);
+    for _ in 0..num_workers {
+        let batch_rx = batch_rx.clone();
+        let shards = Arc::clone(&shards);
+        let handle = thread::spawn(move || {
+            let mini_builder = minimizers(minimizer_size, window_size);
+            let hasher = NtHasher::<false>::new(kmer_size);
+            let mut sk_pos = Vec::new();
+            let mut mini_pos = Vec::new();
+            let mut kmer_hashes = Vec::new();
+
+            while let Ok(batch) = batch_rx.recv() {
+                for packed_seq in batch {
+                    let packed_seq = packed_seq.as_slice();
+                    sk_pos.clear();
+                    mini_pos.clear();
+                    mini_builder
+                        .super_kmers(&mut sk_pos)
+                        .run(packed_seq, &mut mini_pos);
+
+                    if mini_pos.is_empty() {
+                        continue;
+                    }
+
+                    kmer_hashes.clear();
+                    hasher
+                        .hash_kmers_simd(packed_seq, 1)
+                        .collect_into(&mut kmer_hashes);
+                    if kmer_hashes.is_empty() {
+                        continue;
+                    }
+
+                    let last_kmer = kmer_hashes.len();
+                    for idx in 0..mini_pos.len() {
+                        let run_start = sk_pos[idx] as usize;
+                        let run_end = if idx + 1 < sk_pos.len() {
+                            (sk_pos[idx + 1] as usize).min(last_kmer)
+                        } else {
+                            last_kmer
+                        };
+                        if run_start >= run_end {
+                            continue;
+                        }
+
+                        let min_start = mini_pos[idx] as usize;
+                        let minimizer = packed_seq
+                            .slice(min_start..(min_start + minimizer_size))
+                            .as_u64();
+                        let shard_idx = minimizer_shard(minimizer, shard_mask);
+                        let mut shard = shards[shard_idx].lock().unwrap();
+                        shard.mins.insert(minimizer);
+                        shard
+                            .kmers
+                            .extend(kmer_hashes[run_start..run_end].iter().copied());
+                    }
+                }
+            }
         });
-        dict_mini.extend(mini_iter);
-        dict_kmer.extend(&kmer_hashes);
+        worker_handles.push(handle);
     }
-    dict_mini.reserve(dict_mini.len() / 2);
-    Ok((dict_mini, dict_kmer))
+
+    producer_handle.join().expect("Producer thread panicked");
+    for handle in worker_handles {
+        handle.join().expect("Index worker thread panicked");
+    }
+
+    let shards = match Arc::try_unwrap(shards) {
+        Ok(shards) => shards,
+        Err(_) => panic!("Could not acquire ownership of index shards"),
+    };
+
+    let mut out = Vec::with_capacity(num_shards);
+    for shard in shards {
+        out.push(shard.into_inner().unwrap());
+    }
+    Ok(out)
 }
 
 fn process_query_streaming(
     args: &Args,
-    ref_kmer_dict: Arc<KmerIndex>,
-    ref_min_dict: Arc<MinIndex>,
+    ref_index_shards: Arc<FinalIndexShards>,
+    total_kmers: usize,
 ) -> io::Result<()> {
     let kmer_size: usize = args.k;
     let minimizer_size: usize = args.m;
     let window_size: usize = kmer_size - minimizer_size + 1;
     let threshold = args.threshold;
     let output = args.output.clone();
-    let num_consumers = args.threads.unwrap_or_else(|| {
-        thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-    });
+    let num_consumers = default_threads(args.threads).max(1);
 
     let path = args.file.clone();
     let (record_tx, record_rx) = bounded(2 * num_consumers);
@@ -246,8 +362,7 @@ fn process_query_streaming(
     for _ in 0..num_consumers {
         let record_rx_clone = record_rx.clone();
         let result_tx_clone = result_tx.clone();
-        let ref_min_dict_clone = Arc::clone(&ref_min_dict);
-        let ref_kmer_dict_clone = Arc::clone(&ref_kmer_dict);
+        let ref_index_shards_clone = Arc::clone(&ref_index_shards);
 
         let handle = thread::spawn(move || {
             let mini_builder = minimizers(minimizer_size, window_size);
@@ -255,6 +370,9 @@ fn process_query_streaming(
             let mut sk_pos = Vec::new();
             let mut mini_pos = Vec::new();
             let mut kmer_hashes = Vec::new();
+            let mut run_min_words = Vec::new();
+            let mut run_shards = Vec::new();
+            let shard_mask = INDEX_NUM_SHARDS - 1;
             while let Ok((ids, seqs, ends)) = record_rx_clone.recv() {
                 if ends.len() == 1 {
                     // a single long seq
@@ -267,7 +385,7 @@ fn process_query_streaming(
                             (((seq.len().saturating_sub(kmer_size) + 1) as f64) * f).ceil() as usize
                         }
                     }
-                    .min(ref_kmer_dict_clone.len());
+                    .min(total_kmers);
                     let minimizer_threshold: usize = kmer_threshold.div_ceil(window_size);
 
                     let mut packed_seq = PackedSeqVec::default();
@@ -278,17 +396,29 @@ fn process_query_streaming(
                             packed_seq.push_ascii(seq);
                         });
 
+                    sk_pos.clear();
                     mini_pos.clear();
-                    mini_builder.run(packed_seq.as_slice(), &mut mini_pos);
-                    let shared_min_count = mini_pos
+                    mini_builder
+                        .super_kmers(&mut sk_pos)
+                        .run(packed_seq.as_slice(), &mut mini_pos);
+                    run_min_words.clear();
+                    run_shards.clear();
+                    run_min_words.reserve(mini_pos.len());
+                    run_shards.reserve(mini_pos.len());
+                    for &pos in &mini_pos {
+                        let word = packed_seq
+                            .slice((pos as usize)..(pos as usize + minimizer_size))
+                            .as_u64();
+                        let shard_idx = minimizer_shard(word, shard_mask);
+                        run_min_words.push(word);
+                        run_shards.push(shard_idx);
+                    }
+                    let shared_min_count = run_min_words
                         .iter()
-                        .copied()
-                        .map(|pos| {
-                            packed_seq
-                                .slice((pos as usize)..(pos as usize + minimizer_size))
-                                .as_u64()
+                        .zip(run_shards.iter().copied())
+                        .filter(|(word, shard_idx)| {
+                            ref_index_shards_clone[*shard_idx].mins.contains(word)
                         })
-                        .filter(|word| ref_min_dict_clone.contains(word))
                         .count();
 
                     if shared_min_count < minimizer_threshold {
@@ -299,11 +429,26 @@ fn process_query_streaming(
                     hasher
                         .hash_kmers_simd(packed_seq.as_slice(), 1)
                         .collect_into(&mut kmer_hashes);
-                    let kmer_match_count = kmer_hashes
-                        .iter()
-                        .copied()
-                        .filter(|hash| ref_kmer_dict_clone.contains(hash))
-                        .count();
+                    let last_kmer = kmer_hashes.len();
+                    let mut kmer_match_count = 0usize;
+                    for idx in 0..mini_pos.len() {
+                        let run_start = sk_pos[idx] as usize;
+                        let run_end = if idx + 1 < sk_pos.len() {
+                            (sk_pos[idx + 1] as usize).min(last_kmer)
+                        } else {
+                            last_kmer
+                        };
+                        if run_start >= run_end {
+                            continue;
+                        }
+                        let shard_idx = run_shards[idx];
+                        let shard = &ref_index_shards_clone[shard_idx];
+                        kmer_match_count += kmer_hashes[run_start..run_end]
+                            .iter()
+                            .copied()
+                            .filter(|hash| shard.kmers.contains(hash))
+                            .count();
+                    }
 
                     if kmer_match_count >= kmer_threshold {
                         let _ = result_tx_clone.send((id.clone(), seq.clone()));
@@ -332,6 +477,17 @@ fn process_query_streaming(
                     mini_builder
                         .super_kmers(&mut sk_pos)
                         .run(packed_seqs.as_slice(), &mut mini_pos);
+                    run_min_words.clear();
+                    run_shards.clear();
+                    run_min_words.reserve(mini_pos.len());
+                    run_shards.reserve(mini_pos.len());
+                    for &pos in &mini_pos {
+                        let word = packed_seqs
+                            .slice((pos as usize)..(pos as usize + minimizer_size))
+                            .as_u64();
+                        run_min_words.push(word);
+                        run_shards.push(minimizer_shard(word, shard_mask));
+                    }
                     kmer_hashes.clear();
 
                     let mut id_start = 0;
@@ -350,20 +506,28 @@ fn process_query_streaming(
                                     as usize
                             }
                         }
-                        .min(ref_kmer_dict_clone.len());
+                        .min(total_kmers);
                         let minimizer_threshold: usize = kmer_threshold.div_ceil(window_size);
 
+                        let seq_mini_start = mini_idx;
                         let mut shared_min_count = 0;
                         while mini_idx < sk_pos.len() && sk_pos[mini_idx] < kmer_last as u32 {
-                            let pos = mini_pos[mini_idx] as usize;
-                            let word = packed_seqs.slice(pos..(pos + minimizer_size)).as_u64();
-                            shared_min_count += if ref_min_dict_clone.contains(&word) {
-                                1
-                            } else {
-                                0
-                            };
+                            let run_pos = sk_pos[mini_idx] as usize;
+                            if run_pos < packed_start {
+                                mini_idx += 1;
+                                continue;
+                            }
+                            let word = run_min_words[mini_idx];
+                            let shard_idx = run_shards[mini_idx];
+                            shared_min_count +=
+                                if ref_index_shards_clone[shard_idx].mins.contains(&word) {
+                                    1
+                                } else {
+                                    0
+                                };
                             mini_idx += 1;
                         }
+                        let seq_mini_stop = mini_idx;
                         while mini_idx + 1 < sk_pos.len()
                             && sk_pos[mini_idx + 1] <= packed_end as u32
                         {
@@ -383,11 +547,28 @@ fn process_query_streaming(
                                 .collect_into(&mut kmer_hashes);
                         }
 
-                        let kmer_match_count = kmer_hashes[packed_start..kmer_last]
-                            .iter()
-                            .copied()
-                            .filter(|hash| ref_kmer_dict_clone.contains(hash))
-                            .count();
+                        let mut kmer_match_count = 0usize;
+                        for idx in seq_mini_start..seq_mini_stop {
+                            let run_start = sk_pos[idx] as usize;
+                            if run_start < packed_start {
+                                continue;
+                            }
+                            let run_end = if idx + 1 < sk_pos.len() {
+                                (sk_pos[idx + 1] as usize).min(kmer_last)
+                            } else {
+                                kmer_last
+                            };
+                            if run_start >= run_end {
+                                continue;
+                            }
+                            let shard_idx = run_shards[idx];
+                            let shard = &ref_index_shards_clone[shard_idx];
+                            kmer_match_count += kmer_hashes[run_start..run_end]
+                                .iter()
+                                .copied()
+                                .filter(|hash| shard.kmers.contains(hash))
+                                .count();
+                        }
 
                         if kmer_match_count >= kmer_threshold {
                             let _ = result_tx_clone.send((id.to_vec(), seq.to_vec()));
