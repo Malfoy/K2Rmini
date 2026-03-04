@@ -10,7 +10,9 @@ libc = "0.2"
 helicase = { git = "https://github.com/imartayan/helicase.git", branch = "mask", features = [
     "packed-seq",
 ] }
+parking_lot = "0.12"
 simd-minimizers = "2.3"
+rayon = "1"
 regex = "1.12"
 rustc-hash = "2.1"
 
