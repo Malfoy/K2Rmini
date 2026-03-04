@@ -1,26 +1,33 @@
-use core::fmt::Display;
-use core::mem::swap;
-use core::str::FromStr;
-use std::fs::File;
-use std::io::{self, stdout, BufWriter, Write};
-use std::sync::{Arc, LazyLock};
-use std::thread;
-use std::time::Instant;
-
-use clap::Parser;
+use clap::Parser as ClapParser;
 use crossbeam_channel::bounded;
-use needletail::parse_fastx_file;
+use helicase::input::*;
+use helicase::*;
 use regex::bytes::{Regex, RegexBuilder};
 use rustc_hash::FxHashSet;
 use simd_minimizers::minimizers;
 use simd_minimizers::packed_seq::{PackedSeqVec, Seq, SeqVec};
 use simd_minimizers::seq_hash::{KmerHasher, NtHasher};
 
+use core::fmt::Display;
+use core::mem::swap;
+use core::str::FromStr;
+use std::fs::File;
+use std::io::{self, BufWriter, Write, stdout};
+use std::sync::{Arc, LazyLock};
+use std::thread;
+use std::time::Instant;
+
 type MinIndex = FxHashSet<u64>;
 type KmerIndex = FxHashSet<u32>;
 
-const SIMD_LEN_THRESHOLD: usize = 1000; // SIMD is slower for short seqs
 const MSG_LEN_THRESHOLD: usize = 8000; // small enough for long reads
+
+const CONFIG_INDEX: Config = ParserOptions::default()
+    .ignore_headers()
+    .dna_packed()
+    .keep_non_actg()
+    .config();
+const CONFIG_FILTER: Config = ParserOptions::default().config();
 
 static MATCH_N: LazyLock<Regex> = LazyLock::new(|| {
     RegexBuilder::new(r"[N]+")
@@ -67,7 +74,7 @@ impl Display for Threshold {
     }
 }
 
-#[derive(Parser, Debug)]
+#[derive(ClapParser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// FASTA/Q file to filter (possibly compressed)
@@ -156,40 +163,28 @@ fn index_reference(args: &Args) -> io::Result<(MinIndex, KmerIndex)> {
     let window_size: usize = kmer_size - minimizer_size + 1;
     let mini_builder = minimizers(minimizer_size, window_size);
     let hasher = NtHasher::<false>::new(kmer_size);
-    let mut reader =
-        parse_fastx_file(&args.patterns).expect("Failed to parse file containing patterns");
+    let mut parser = FastxParser::<CONFIG_INDEX>::from_file_in_ram(&args.patterns)
+        .expect("Failed to parse file containing patterns");
     let mut dict_mini = MinIndex::default();
     let mut dict_kmer = KmerIndex::default();
     let mut mini_pos = Vec::new();
     let mut kmer_hashes = Vec::new();
 
-    while let Some(result) = reader.next() {
-        let record = result.map_err(io::Error::other)?;
-        let seq = &record.seq();
-        MATCH_N
-            .split(seq)
-            .filter(|&seq| seq.len() >= kmer_size)
-            .for_each(|seq| {
-                let packed_seq = PackedSeqVec::from_ascii(seq);
-                mini_pos.clear();
-                kmer_hashes.clear();
-                if seq.len() >= kmer_size + SIMD_LEN_THRESHOLD {
-                    mini_builder.run(packed_seq.as_slice(), &mut mini_pos);
-                    hasher
-                        .hash_kmers_simd(packed_seq.as_slice(), 1)
-                        .collect_into(&mut kmer_hashes);
-                } else {
-                    mini_builder.run_scalar(packed_seq.as_slice(), &mut mini_pos);
-                    kmer_hashes.extend(hasher.hash_kmers_scalar(packed_seq.as_slice()));
-                }
-                let mini_iter = mini_pos.iter().copied().map(|pos| {
-                    packed_seq
-                        .slice((pos as usize)..(pos as usize + minimizer_size))
-                        .as_u64()
-                });
-                dict_mini.extend(mini_iter);
-                dict_kmer.extend(&kmer_hashes);
-            });
+    while let Some(_) = parser.next() {
+        let packed_seq = parser.get_packed_seq();
+        mini_pos.clear();
+        kmer_hashes.clear();
+        mini_builder.run(packed_seq, &mut mini_pos);
+        hasher
+            .hash_kmers_simd(packed_seq, 1)
+            .collect_into(&mut kmer_hashes);
+        let mini_iter = mini_pos.iter().copied().map(|pos| {
+            packed_seq
+                .slice((pos as usize)..(pos as usize + minimizer_size))
+                .as_u64()
+        });
+        dict_mini.extend(mini_iter);
+        dict_kmer.extend(&kmer_hashes);
     }
     dict_mini.reserve(dict_mini.len() / 2);
     Ok((dict_mini, dict_kmer))
@@ -211,7 +206,7 @@ fn process_query_streaming(
             .unwrap_or(4)
     });
 
-    let mut parser = parse_fastx_file(&args.file).expect("Failed to parse file to filter");
+    let path = args.file.clone();
     let (record_tx, record_rx) = bounded(2 * num_consumers);
     let (result_tx, result_rx) = bounded(4 * num_consumers);
 
@@ -219,30 +214,27 @@ fn process_query_streaming(
         let mut ids = Vec::new();
         let mut seqs = Vec::new();
         let mut ends = Vec::new();
-        while let Some(result) = parser.next() {
-            match result {
-                Ok(record) => {
-                    let id = record.id();
-                    let seq = &record.seq();
-                    if seq.len() < kmer_size {
-                        continue;
-                    }
-                    ids.extend_from_slice(id);
-                    seqs.extend_from_slice(seq);
-                    ends.push((ids.len(), seqs.len()));
-                    if seqs.len() >= MSG_LEN_THRESHOLD {
-                        let mut tmp_ids = Vec::new();
-                        let mut tmp_seqs = Vec::new();
-                        let mut tmp_ends = Vec::new();
-                        swap(&mut ids, &mut tmp_ids);
-                        swap(&mut seqs, &mut tmp_seqs);
-                        swap(&mut ends, &mut tmp_ends);
-                        if record_tx.send((tmp_ids, tmp_seqs, tmp_ends)).is_err() {
-                            break;
-                        }
-                    }
+        let mut parser =
+            FastxParser::<CONFIG_FILTER>::from_file(&path).expect("Failed to parse file to filter");
+        while let Some(_) = parser.next() {
+            let id = parser.get_header();
+            let seq = parser.get_dna_string();
+            if seq.len() < kmer_size {
+                continue;
+            }
+            ids.extend_from_slice(id);
+            seqs.extend_from_slice(seq);
+            ends.push((ids.len(), seqs.len()));
+            if seqs.len() >= MSG_LEN_THRESHOLD {
+                let mut tmp_ids = Vec::new();
+                let mut tmp_seqs = Vec::new();
+                let mut tmp_ends = Vec::new();
+                swap(&mut ids, &mut tmp_ids);
+                swap(&mut seqs, &mut tmp_seqs);
+                swap(&mut ends, &mut tmp_ends);
+                if record_tx.send((tmp_ids, tmp_seqs, tmp_ends)).is_err() {
+                    break;
                 }
-                Err(e) => eprintln!("Error reading record: {e}"),
             }
         }
         if !seqs.is_empty() {

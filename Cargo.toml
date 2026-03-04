@@ -1,15 +1,17 @@
 [package]
 name = "K2Rmini"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 crossbeam-channel = "0.5"
 libc = "0.2"
-needletail = "0.6"
-simd-minimizers = "2.2"
-regex = "1.11"
+helicase = { git = "https://github.com/imartayan/helicase.git", branch = "mask", features = [
+    "packed-seq",
+] }
+simd-minimizers = "2.3"
+regex = "1.12"
 rustc-hash = "2.1"
 
 [profile.release]
