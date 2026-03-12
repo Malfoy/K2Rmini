@@ -57,6 +57,10 @@ Let's say this time we have a list of *k*-mers of size 63 stored in `patterns.fa
 K2Rmini -p patterns.fa -k 63 -t 2 reads.fa
 ```
 
+## Benchmarks
+
+Benchmarks and plots against other sequence filtering tools are available in the [experiments repository](https://github.com/imartayan/K2Rmini_experiments).
+
 ## Citation
 
 > Accelerating *k*-mer based sequence filtering. I. Martayan, L. Vandamme, B. Constantinides, B. Cazaux, C. Paperman and A. Limasset. https://doi.org/10.1101/2025.06.16.659853
