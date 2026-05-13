@@ -57,6 +57,35 @@ Let's say this time we have a list of *k*-mers of size 63 stored in `patterns.fa
 K2Rmini -p patterns.fa -k 63 -t 2 reads.fa
 ```
 
+## K2Rminimulti
+
+`k2rminimulti` filters reads using several query files at once. A read is kept only if it satisfies every constraint.
+
+```
+Usage: k2rminimulti [OPTIONS] --constraint <PATTERNS> <THRESHOLD> <FILE>
+
+Arguments:
+  <FILE>  FASTA/Q file to filter (possibly compressed)
+
+Options:
+  -c, --constraint <PATTERNS> <THRESHOLD>  FASTA/Q file containing k-mers of interest and its threshold; may be repeated
+  -o <OUTPUT>                              Output file for filtered sequences [default: stdout]
+  -k <K>                                   K-mer size [default: 31]
+  -m <M>                                   Minimizer size, must be <= k, up to 29 [default: 21]
+  -T, --threads <THREADS>                  Number of threads [default: all]
+  -h, --help                               Print help
+  -V, --version                            Print version
+```
+
+Example:
+```sh
+k2rminimulti -c Q1.fa 10 -c Q2.fa 5 -c Q3.fa 0.25 reads.fa
+```
+
+This keeps reads sharing at least 10 *k*-mers with `Q1.fa`, at least 5 with `Q2.fa`, and at least 25% of their *k*-mers with `Q3.fa`. The constraints are combined with AND semantics.
+
+Internally, `k2rminimulti` stores 32-bit keys and 32-bit presence masks in both the *k*-mer hash map and minimizer map, so it supports up to 32 query files.
+
 ## Benchmarks
 
 Benchmarks and plots against other sequence filtering tools are available in the [experiments repository](https://github.com/imartayan/K2Rmini_experiments).
