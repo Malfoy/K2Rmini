@@ -4,14 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 crossbeam-channel = "0.5"
 libc = "0.2"
-helicase = { git = "https://github.com/imartayan/helicase.git", features = [
-    "packed-seq",
-] }
-simd-minimizers = "2.3"
-regex = "1.12"
+helicase = { version = "1.0", features = ["packed-seq"] }
+simd-minimizers = "3.0"
+regex = "1.13"
 rustc-hash = "2.1"
 
 [profile.release]

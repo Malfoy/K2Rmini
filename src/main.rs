@@ -163,27 +163,23 @@ fn index_reference(args: &Args) -> io::Result<(MinIndex, KmerIndex)> {
     let window_size: usize = kmer_size - minimizer_size + 1;
     let mini_builder = minimizers(minimizer_size, window_size);
     let hasher = NtHasher::<false>::new(kmer_size);
-    let mut parser = FastxParser::<CONFIG_INDEX>::from_file_in_ram(&args.patterns)
+    let mut parser = FastxParser::<CONFIG_INDEX>::from_file(&args.patterns)
         .expect("Failed to parse file containing patterns");
     let mut dict_mini = MinIndex::default();
     let mut dict_kmer = KmerIndex::default();
     let mut mini_pos = Vec::new();
     let mut kmer_hashes = Vec::new();
 
-    while let Some(_) = parser.next() {
+    while let Some(event) = parser.next() {
+        event?;
         let packed_seq = parser.get_packed_seq();
         mini_pos.clear();
         kmer_hashes.clear();
-        mini_builder.run(packed_seq, &mut mini_pos);
+        let out = mini_builder.run(packed_seq, &mut mini_pos);
         hasher
             .hash_kmers_simd(packed_seq, 1)
             .collect_into(&mut kmer_hashes);
-        let mini_iter = mini_pos.iter().copied().map(|pos| {
-            packed_seq
-                .slice((pos as usize)..(pos as usize + minimizer_size))
-                .as_u64()
-        });
-        dict_mini.extend(mini_iter);
+        dict_mini.extend(out.values_u64());
         dict_kmer.extend(&kmer_hashes);
     }
     dict_mini.reserve(dict_mini.len() / 2);
@@ -216,7 +212,8 @@ fn process_query_streaming(
         let mut ends = Vec::new();
         let mut parser =
             FastxParser::<CONFIG_FILTER>::from_file(&path).expect("Failed to parse file to filter");
-        while let Some(_) = parser.next() {
+        while let Some(event) = parser.next() {
+            event.unwrap();
             let id = parser.get_header();
             let seq = parser.get_dna_string();
             if seq.len() < kmer_size {
@@ -279,15 +276,9 @@ fn process_query_streaming(
                         });
 
                     mini_pos.clear();
-                    mini_builder.run(packed_seq.as_slice(), &mut mini_pos);
-                    let shared_min_count = mini_pos
-                        .iter()
-                        .copied()
-                        .map(|pos| {
-                            packed_seq
-                                .slice((pos as usize)..(pos as usize + minimizer_size))
-                                .as_u64()
-                        })
+                    let out = mini_builder.run(packed_seq.as_slice(), &mut mini_pos);
+                    let shared_min_count = out
+                        .values_u64()
                         .filter(|word| ref_min_dict_clone.contains(word))
                         .count();
 

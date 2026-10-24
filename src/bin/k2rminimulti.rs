@@ -265,14 +265,15 @@ fn index_one_reference(args: &Args, patterns: &str) -> io::Result<(LocalMinIndex
     let window_size: usize = kmer_size - minimizer_size + 1;
     let mini_builder = minimizers(minimizer_size, window_size);
     let hasher = NtHasher::<false>::new(kmer_size);
-    let mut parser = FastxParser::<CONFIG_INDEX>::from_file_in_ram(patterns)
+    let mut parser = FastxParser::<CONFIG_INDEX>::from_file(patterns)
         .expect("Failed to parse file containing patterns");
     let mut dict_mini = LocalMinIndex::default();
     let mut dict_kmer = LocalKmerIndex::default();
     let mut mini_pos = Vec::new();
     let mut kmer_hashes = Vec::new();
 
-    while let Some(_) = parser.next() {
+    while let Some(event) = parser.next() {
+        event?;
         let packed_seq = parser.get_packed_seq();
         mini_pos.clear();
         kmer_hashes.clear();
@@ -379,7 +380,8 @@ fn process_query_streaming(
         let mut ends = Vec::new();
         let mut parser =
             FastxParser::<CONFIG_FILTER>::from_file(&path).expect("Failed to parse file to filter");
-        while let Some(_) = parser.next() {
+        while let Some(event) = parser.next() {
+            event.unwrap();
             let id = parser.get_header();
             let seq = parser.get_dna_string();
             if seq.len() < kmer_size {
