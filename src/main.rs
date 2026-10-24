@@ -1,6 +1,5 @@
 use clap::Parser as ClapParser;
 use crossbeam_channel::bounded;
-use helicase::input::*;
 use helicase::*;
 use rustc_hash::FxHashSet;
 use simd_minimizers::minimizers;
@@ -10,12 +9,14 @@ use core::fmt::Display;
 use core::str::FromStr;
 use std::fs::File;
 use std::io::{self, BufWriter, Write, stdout};
-use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
+mod sparse_bitset;
+use sparse_bitset::ConcurrentBlockSparseBitSet;
+
 type MinIndex = FxHashSet<u64>;
-type KmerIndex = FxHashSet<u32>;
+type KmerIndex = ConcurrentBlockSparseBitSet;
 
 const CONFIG_INDEX: Config = ParserOptions::default()
     .ignore_headers()
@@ -122,23 +123,22 @@ fn main() -> io::Result<()> {
 
     eprintln!("Indexing k-mers and minimizers of interest...");
     let start = Instant::now();
-    let (min_dict, kmer_dict) = index_reference(&args)?;
+    let (ref_min_dict, ref_kmer_dict) = index_reference(&args)?;
     eprintln!(
         "Took {:.02} s, RAM: {:.03} GB",
         start.elapsed().as_secs_f64(),
         mem_usage_gb()
     );
-    let ref_min_dict = Arc::new(min_dict);
-    let ref_kmer_dict = Arc::new(kmer_dict);
+    let ref_kmer_dict_len = ref_kmer_dict.len();
     eprintln!(
         "Indexed {} k-mers and {} minimizers.",
-        ref_kmer_dict.len(),
+        ref_kmer_dict_len,
         ref_min_dict.len()
     );
 
     eprintln!("Filtering sequences in parallel...");
     let start = Instant::now();
-    process_query_streaming(&args, Arc::clone(&ref_kmer_dict), Arc::clone(&ref_min_dict))?;
+    process_query_streaming(&args, &ref_kmer_dict, ref_kmer_dict_len, &ref_min_dict)?;
     eprintln!(
         "Took {:.02} s, RAM: {:.03} GB",
         start.elapsed().as_secs_f64(),
@@ -152,35 +152,80 @@ fn index_reference(args: &Args) -> io::Result<(MinIndex, KmerIndex)> {
     let kmer_size: usize = args.k;
     let minimizer_size: usize = args.m;
     let window_size: usize = kmer_size - minimizer_size + 1;
-    let mini_builder = minimizers(minimizer_size, window_size);
-    let hasher = NtHasher::<false>::new(kmer_size);
-    let mut parser = FastxParser::<CONFIG_INDEX>::from_file(&args.patterns)
-        .expect("Failed to parse file containing patterns");
-    let mut dict_mini = MinIndex::default();
-    let mut dict_kmer = KmerIndex::default();
-    let mut mini_pos = Vec::new();
-    let mut kmer_hashes = Vec::new();
+    let num_threads = args.threads.unwrap_or_else(|| {
+        thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    });
 
-    while let Some(event) = parser.next() {
-        event?;
-        let packed_seq = parser.get_packed_seq();
-        mini_pos.clear();
-        kmer_hashes.clear();
-        let out = mini_builder.run(packed_seq, &mut mini_pos);
-        hasher
-            .hash_kmers_simd(packed_seq, 1)
-            .collect_into(&mut kmer_hashes);
-        dict_mini.extend(out.values_u64());
-        dict_kmer.extend(&kmer_hashes);
+    let kmer_dict = KmerIndex::new();
+    let (mini_dict_tx, mini_dict_rx) = crossbeam_channel::unbounded::<MinIndex>();
+
+    ParallelFastxParser::<CONFIG_INDEX>::from_file(&args.patterns)
+        .expect("Failed to parse file containing patterns")
+        .threads(num_threads)
+        .for_each(|mut parser| {
+            let mini_hasher = NtHasher::<false>::new(minimizer_size);
+            let mini_builder = minimizers(minimizer_size, window_size).hasher(&mini_hasher);
+            let hasher = NtHasher::<false>::new(kmer_size);
+            let mut local_mini = MinIndex::default();
+            let mut mini_pos = Vec::new();
+            let mut super_kmers = Vec::new();
+            let mut kmer_hashes = Vec::new();
+
+            while let Some(event) = parser.next() {
+                event?;
+                let packed_seq = parser.get_packed_seq();
+                let num_kmers = parser.get_dna_len().saturating_sub(kmer_size - 1);
+                if num_kmers == 0 {
+                    continue;
+                }
+                mini_pos.clear();
+                super_kmers.clear();
+                let out = mini_builder
+                    .super_kmers(&mut super_kmers)
+                    .run(packed_seq, &mut mini_pos);
+                super_kmers.push(num_kmers as u32);
+
+                kmer_hashes.clear();
+                hasher
+                    .hash_kmers_simd(packed_seq, 1)
+                    .collect_into(&mut kmer_hashes);
+
+                for (min_val, bounds) in out.values_u64().zip(super_kmers.windows(2)) {
+                    local_mini.insert(min_val);
+                    kmer_dict.insert_batch(
+                        min_val,
+                        &kmer_hashes[bounds[0] as usize..bounds[1] as usize],
+                    );
+                }
+            }
+            let _ = mini_dict_tx.send(local_mini);
+            Ok(())
+        })
+        .expect("ParallelFastxParser failed on patterns");
+
+    drop(mini_dict_tx);
+    let mut dict_mini = MinIndex::default();
+    for local_set in mini_dict_rx.iter() {
+        if dict_mini.len() < local_set.len() {
+            let mut tmp = local_set;
+            core::mem::swap(&mut dict_mini, &mut tmp);
+            dict_mini.extend(tmp);
+        } else {
+            dict_mini.extend(local_set);
+        }
     }
     dict_mini.reserve(dict_mini.len() / 2);
-    Ok((dict_mini, dict_kmer))
+
+    Ok((dict_mini, kmer_dict))
 }
 
 fn process_query_streaming(
     args: &Args,
-    ref_kmer_dict: Arc<KmerIndex>,
-    ref_min_dict: Arc<MinIndex>,
+    ref_kmer_dict: &KmerIndex,
+    ref_kmer_dict_len: usize,
+    ref_min_dict: &MinIndex,
 ) -> io::Result<()> {
     let kmer_size: usize = args.k;
     let minimizer_size: usize = args.m;
@@ -194,26 +239,19 @@ fn process_query_streaming(
     });
 
     let path = &args.file;
-    let (result_tx, result_rx) = bounded::<(Vec<u8>, Vec<u8>)>(4 * num_threads);
+    const BATCH_SIZE: usize = 64 * 1024;
+    let (result_tx, result_rx) = bounded::<Vec<u8>>(4 * num_threads);
 
     let printer_handle = thread::spawn(move || {
         if let Some(out) = output {
             let file = File::create(out).expect("Failed to open output file");
             let mut writer = BufWriter::new(file);
-            for (id, seq) in result_rx.iter() {
-                writer.write_all(b">")?;
-                writer.write_all(&id)?;
-                writer.write_all(b"\n")?;
-                writer.write_all(&seq)?;
-                writer.write_all(b"\n")?;
+            for chunk in result_rx.iter() {
+                writer.write_all(&chunk)?;
             }
         } else {
-            for (id, seq) in result_rx.iter() {
-                stdout().write_all(b">")?;
-                stdout().write_all(&id)?;
-                stdout().write_all(b"\n")?;
-                stdout().write_all(&seq)?;
-                stdout().write_all(b"\n")?;
+            for chunk in result_rx.iter() {
+                stdout().write_all(&chunk)?;
             }
         }
         io::Result::Ok(())
@@ -223,10 +261,14 @@ fn process_query_streaming(
         .expect("Failed to parse file to filter")
         .threads(num_threads)
         .for_each(|mut parser| {
-            let mini_builder = minimizers(minimizer_size, window_size);
+            let mini_hasher = NtHasher::<false>::new(minimizer_size);
+            let mini_builder = minimizers(minimizer_size, window_size).hasher(&mini_hasher);
             let hasher = NtHasher::<false>::new(kmer_size);
             let mut mini_pos = Vec::new();
+            let mut super_kmers = Vec::new();
+            let mut matched_sk: Vec<(u64, usize, usize)> = Vec::new();
             let mut kmer_hashes = Vec::new();
+            let mut local_buf = Vec::with_capacity(BATCH_SIZE + 4096);
 
             while let Some(event) = parser.next() {
                 event?;
@@ -241,18 +283,29 @@ fn process_query_streaming(
                         (((seq_len - kmer_size + 1) as f64) * f).ceil() as usize
                     }
                 }
-                .min(ref_kmer_dict.len());
+                .min(ref_kmer_dict_len);
                 let minimizer_threshold: usize = kmer_threshold.div_ceil(window_size);
 
                 let packed_seq = parser.get_packed_seq();
+                let num_kmers = seq_len - kmer_size + 1;
                 mini_pos.clear();
-                let out = mini_builder.run(packed_seq, &mut mini_pos);
-                let shared_min_count = out
-                    .values_u64()
-                    .filter(|word| ref_min_dict.contains(word))
-                    .count();
+                super_kmers.clear();
+                let out = mini_builder
+                    .super_kmers(&mut super_kmers)
+                    .run(packed_seq, &mut mini_pos);
+                super_kmers.push(num_kmers as u32);
 
-                if shared_min_count < minimizer_threshold {
+                matched_sk.clear();
+                let mut possible_kmers: usize = 0;
+                for (min_val, bounds) in out.values_u64().zip(super_kmers.windows(2)) {
+                    if ref_min_dict.contains(&min_val) {
+                        let span = (bounds[1] - bounds[0]) as usize;
+                        possible_kmers += span;
+                        matched_sk.push((min_val, bounds[0] as usize, bounds[1] as usize));
+                    }
+                }
+
+                if matched_sk.len() < minimizer_threshold || possible_kmers < kmer_threshold {
                     continue;
                 }
 
@@ -260,17 +313,42 @@ fn process_query_streaming(
                 hasher
                     .hash_kmers_simd(packed_seq, 1)
                     .collect_into(&mut kmer_hashes);
-                let kmer_match_count = kmer_hashes
-                    .iter()
-                    .copied()
-                    .filter(|hash| ref_kmer_dict.contains(hash))
-                    .count();
+
+                let mut kmer_match_count = 0;
+                let mut remaining_possible = possible_kmers;
+                for &(min_val, start, end) in &matched_sk {
+                    let span = end - start;
+                    if let Some(page) = ref_kmer_dict.get_page(min_val) {
+                        for &h in &kmer_hashes[start..end] {
+                            if ConcurrentBlockSparseBitSet::page_contains(page, h) {
+                                kmer_match_count += 1;
+                            }
+                        }
+                    }
+                    remaining_possible -= span;
+                    if kmer_match_count >= kmer_threshold
+                        || kmer_match_count + remaining_possible < kmer_threshold
+                    {
+                        break;
+                    }
+                }
 
                 if kmer_match_count >= kmer_threshold {
-                    let id = parser.get_header_owned();
-                    let seq = parser.get_dna_string_owned();
-                    let _ = result_tx.send((id, seq));
+                    local_buf.push(b'>');
+                    local_buf.extend_from_slice(parser.get_header());
+                    local_buf.push(b'\n');
+                    local_buf.extend_from_slice(parser.get_dna_string());
+                    local_buf.push(b'\n');
+
+                    if local_buf.len() >= BATCH_SIZE {
+                        let mut send_buf = Vec::with_capacity(BATCH_SIZE + 4096);
+                        std::mem::swap(&mut local_buf, &mut send_buf);
+                        let _ = result_tx.send(send_buf);
+                    }
                 }
+            }
+            if !local_buf.is_empty() {
+                let _ = result_tx.send(local_buf);
             }
             Ok(())
         })
