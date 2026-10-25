@@ -1,7 +1,7 @@
 use clap::Parser as ClapParser;
 use crossbeam_channel::bounded;
 use helicase::*;
-use rustc_hash::FxHashSet;
+use packed_seq::Seq;
 use simd_minimizers::minimizers;
 use simd_minimizers::seq_hash::{KmerHasher, NtHasher};
 
@@ -12,10 +12,12 @@ use std::io::{self, BufWriter, Write, stdout};
 use std::thread;
 use std::time::Instant;
 
+mod sharded_hashset;
 mod sparse_bitset;
+use sharded_hashset::{ConcurrentShardedSet, ShardedHashSet};
 use sparse_bitset::ConcurrentBlockSparseBitSet;
 
-type MinIndex = FxHashSet<u64>;
+type MinIndex = ShardedHashSet;
 type KmerIndex = ConcurrentBlockSparseBitSet;
 
 const CONFIG_INDEX: Config = ParserOptions::default()
@@ -149,9 +151,12 @@ fn main() -> io::Result<()> {
 }
 
 fn index_reference(args: &Args) -> io::Result<(MinIndex, KmerIndex)> {
+    const BATCH_KMERS: usize = 2_000_000;
+
     let kmer_size: usize = args.k;
     let minimizer_size: usize = args.m;
     let window_size: usize = kmer_size - minimizer_size + 1;
+    let window_span_bp = window_size + kmer_size - 1;
     let num_threads = args.threads.unwrap_or_else(|| {
         thread::available_parallelism()
             .map(|n| n.get())
@@ -159,7 +164,7 @@ fn index_reference(args: &Args) -> io::Result<(MinIndex, KmerIndex)> {
     });
 
     let kmer_dict = KmerIndex::new();
-    let (mini_dict_tx, mini_dict_rx) = crossbeam_channel::unbounded::<MinIndex>();
+    let mini_dict = ConcurrentShardedSet::new();
 
     ParallelFastxParser::<CONFIG_INDEX>::from_file(&args.patterns)
         .expect("Failed to parse file containing patterns")
@@ -168,7 +173,7 @@ fn index_reference(args: &Args) -> io::Result<(MinIndex, KmerIndex)> {
             let mini_hasher = NtHasher::<false>::new(minimizer_size);
             let mini_builder = minimizers(minimizer_size, window_size).hasher(&mini_hasher);
             let hasher = NtHasher::<false>::new(kmer_size);
-            let mut local_mini = MinIndex::default();
+            let mut local_mini = mini_dict.local_writer();
             let mut mini_pos = Vec::new();
             let mut super_kmers = Vec::new();
             let mut kmer_hashes = Vec::new();
@@ -180,6 +185,8 @@ fn index_reference(args: &Args) -> io::Result<(MinIndex, KmerIndex)> {
                 if num_kmers == 0 {
                     continue;
                 }
+
+                if num_kmers <= BATCH_KMERS {
                 mini_pos.clear();
                 super_kmers.clear();
                 let out = mini_builder
@@ -198,27 +205,45 @@ fn index_reference(args: &Args) -> io::Result<(MinIndex, KmerIndex)> {
                         min_val,
                         &kmer_hashes[bounds[0] as usize..bounds[1] as usize],
                     );
+                    }
+                } else {
+                    for k_start in (0..num_kmers).step_by(BATCH_KMERS) {
+                        let k_len = (num_kmers - k_start).min(BATCH_KMERS);
+                        let chunk_end_bp =
+                            (k_start + k_len - 1 + window_span_bp).min(packed_seq.len());
+                        let sub_seq = packed_seq.slice(k_start..chunk_end_bp);
+                        let sub_num_kmers = sub_seq.len().saturating_sub(kmer_size - 1);
+
+                        mini_pos.clear();
+                        super_kmers.clear();
+                        kmer_hashes.clear();
+
+                        let out = mini_builder
+                            .super_kmers(&mut super_kmers)
+                            .run(sub_seq, &mut mini_pos);
+                        super_kmers.push(sub_num_kmers as u32);
+
+                        hasher
+                            .hash_kmers_simd(sub_seq, 1)
+                            .collect_into(&mut kmer_hashes);
+
+                        for (min_val, bounds) in out.values_u64().zip(super_kmers.windows(2)) {
+                            let start_w = bounds[0] as usize;
+                            if start_w >= k_len {
+                                break;
+                            }
+                            let end_w = (bounds[1] as usize).min(k_len);
+                            local_mini.insert(min_val);
+                            kmer_dict.insert_batch(min_val, &kmer_hashes[start_w..end_w]);
+                        }
+                    }
                 }
             }
-            let _ = mini_dict_tx.send(local_mini);
             Ok(())
         })
         .expect("ParallelFastxParser failed on patterns");
 
-    drop(mini_dict_tx);
-    let mut dict_mini = MinIndex::default();
-    for local_set in mini_dict_rx.iter() {
-        if dict_mini.len() < local_set.len() {
-            let mut tmp = local_set;
-            core::mem::swap(&mut dict_mini, &mut tmp);
-            dict_mini.extend(tmp);
-        } else {
-            dict_mini.extend(local_set);
-        }
-    }
-    dict_mini.reserve(dict_mini.len() / 2);
-
-    Ok((dict_mini, kmer_dict))
+    Ok((mini_dict.freeze(), kmer_dict))
 }
 
 fn process_query_streaming(
@@ -227,6 +252,8 @@ fn process_query_streaming(
     ref_kmer_dict_len: usize,
     ref_min_dict: &MinIndex,
 ) -> io::Result<()> {
+    const BATCH_SIZE: usize = 64 * 1024;
+
     let kmer_size: usize = args.k;
     let minimizer_size: usize = args.m;
     let window_size: usize = kmer_size - minimizer_size + 1;
@@ -239,7 +266,6 @@ fn process_query_streaming(
     });
 
     let path = &args.file;
-    const BATCH_SIZE: usize = 64 * 1024;
     let (result_tx, result_rx) = bounded::<Vec<u8>>(4 * num_threads);
 
     let printer_handle = thread::spawn(move || {
