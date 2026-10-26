@@ -89,6 +89,9 @@ struct Args {
     /// Minimizer size, must be ≤ k, up to 29
     #[arg(short, default_value_t = 21)]
     m: usize,
+    /// Approximate filtering: only index and filter by minimizers (no k-mers indexed)
+    #[arg(short = 'a', long)]
+    approx: bool,
     /// Number of threads [default: all]
     #[arg(short = 'T', long)]
     threads: Option<usize>,
@@ -123,7 +126,11 @@ fn main() -> io::Result<()> {
         args.threshold
     );
 
-    eprintln!("Indexing k-mers and minimizers of interest...");
+    if args.approx {
+        eprintln!("Indexing minimizers of interest (approximate mode)...");
+    } else {
+        eprintln!("Indexing k-mers and minimizers of interest...");
+    }
     let start = Instant::now();
     let (ref_min_dict, ref_kmer_dict) = index_reference(&args)?;
     eprintln!(
@@ -131,12 +138,16 @@ fn main() -> io::Result<()> {
         start.elapsed().as_secs_f64(),
         mem_usage_gb()
     );
-    let ref_kmer_dict_len = ref_kmer_dict.len();
-    eprintln!(
-        "Indexed {} k-mers and {} minimizers.",
-        ref_kmer_dict_len,
-        ref_min_dict.len()
-    );
+    let ref_kmer_dict_len = if args.approx { 0 } else { ref_kmer_dict.len() };
+    if args.approx {
+        eprintln!("Indexed {} minimizers.", ref_min_dict.len());
+    } else {
+        eprintln!(
+            "Indexed {} k-mers and {} minimizers.",
+            ref_kmer_dict_len,
+            ref_min_dict.len()
+        );
+    }
 
     eprintln!("Filtering sequences in parallel...");
     let start = Instant::now();
@@ -162,6 +173,7 @@ fn index_reference(args: &Args) -> io::Result<(MinIndex, KmerIndex)> {
             .map(|n| n.get())
             .unwrap_or(4)
     });
+    let is_approx = args.approx;
 
     let kmer_dict = KmerIndex::new();
     let mini_dict = ConcurrentShardedSet::new();
@@ -188,53 +200,58 @@ fn index_reference(args: &Args) -> io::Result<(MinIndex, KmerIndex)> {
 
                 if num_kmers <= BATCH_KMERS {
                     mini_pos.clear();
-                    super_kmers.clear();
-                    let out = mini_builder
-                        .super_kmers(&mut super_kmers)
-                        .run(packed_seq, &mut mini_pos);
-                    super_kmers.push(num_kmers as u32);
-
-                    kmer_hashes.clear();
-                    hasher
-                        .hash_kmers_simd(packed_seq, 1)
-                        .collect_into(&mut kmer_hashes);
-
-                    for (min_val, bounds) in out.values_u64().zip(super_kmers.windows(2)) {
-                        local_mini.insert(min_val);
-                        kmer_dict.insert_batch(
-                            min_val,
-                            &kmer_hashes[bounds[0] as usize..bounds[1] as usize],
-                        );
+                    if is_approx {
+                        let out = mini_builder.run(packed_seq, &mut mini_pos);
+                        local_mini.extend(out.values_u64());
+                    } else {
+                        super_kmers.clear();
+                        kmer_hashes.clear();
+                        let out = mini_builder
+                            .super_kmers(&mut super_kmers)
+                            .run(packed_seq, &mut mini_pos);
+                        super_kmers.push(num_kmers as u32);
+                        hasher
+                            .hash_kmers_simd(packed_seq, 1)
+                            .collect_into(&mut kmer_hashes);
+                        for (min_val, bounds) in out.values_u64().zip(super_kmers.windows(2)) {
+                            local_mini.insert(min_val);
+                            kmer_dict.insert_batch(
+                                min_val,
+                                &kmer_hashes[bounds[0] as usize..bounds[1] as usize],
+                            );
+                        }
                     }
                 } else {
                     for k_start in (0..num_kmers).step_by(BATCH_KMERS) {
                         let k_len = (num_kmers - k_start).min(BATCH_KMERS);
-                        let chunk_end_bp =
+                        let chunk_end =
                             (k_start + k_len - 1 + window_span_bp).min(packed_seq.len());
-                        let sub_seq = packed_seq.slice(k_start..chunk_end_bp);
+                        let sub_seq = packed_seq.slice(k_start..chunk_end);
                         let sub_num_kmers = sub_seq.len().saturating_sub(kmer_size - 1);
 
                         mini_pos.clear();
-                        super_kmers.clear();
-                        kmer_hashes.clear();
-
-                        let out = mini_builder
-                            .super_kmers(&mut super_kmers)
-                            .run(sub_seq, &mut mini_pos);
-                        super_kmers.push(sub_num_kmers as u32);
-
-                        hasher
-                            .hash_kmers_simd(sub_seq, 1)
-                            .collect_into(&mut kmer_hashes);
-
-                        for (min_val, bounds) in out.values_u64().zip(super_kmers.windows(2)) {
-                            let start_w = bounds[0] as usize;
-                            if start_w >= k_len {
-                                break;
+                        if is_approx {
+                            let out = mini_builder.run(sub_seq, &mut mini_pos);
+                            local_mini.extend(out.values_u64());
+                        } else {
+                            super_kmers.clear();
+                            kmer_hashes.clear();
+                            let out = mini_builder
+                                .super_kmers(&mut super_kmers)
+                                .run(sub_seq, &mut mini_pos);
+                            super_kmers.push(sub_num_kmers as u32);
+                            hasher
+                                .hash_kmers_simd(sub_seq, 1)
+                                .collect_into(&mut kmer_hashes);
+                            for (min_val, bounds) in out.values_u64().zip(super_kmers.windows(2)) {
+                                let start_w = bounds[0] as usize;
+                                if start_w >= k_len {
+                                    break;
+                                }
+                                let end_w = (bounds[1] as usize).min(k_len);
+                                local_mini.insert(min_val);
+                                kmer_dict.insert_batch(min_val, &kmer_hashes[start_w..end_w]);
                             }
-                            let end_w = (bounds[1] as usize).min(k_len);
-                            local_mini.insert(min_val);
-                            kmer_dict.insert_batch(min_val, &kmer_hashes[start_w..end_w]);
                         }
                     }
                 }
@@ -259,6 +276,7 @@ fn process_query_streaming(
     let window_size: usize = kmer_size - minimizer_size + 1;
     let threshold = args.threshold;
     let output = args.output.clone();
+    let is_approx = args.approx;
     let num_threads = args.threads.unwrap_or_else(|| {
         thread::available_parallelism()
             .map(|n| n.get())
@@ -308,58 +326,68 @@ fn process_query_streaming(
                     Threshold::Relative(f) => {
                         (((seq_len - kmer_size + 1) as f64) * f).ceil() as usize
                     }
-                }
-                .min(ref_kmer_dict_len);
+                };
+                let kmer_threshold = if ref_kmer_dict_len > 0 {
+                    kmer_threshold.min(ref_kmer_dict_len)
+                } else {
+                    kmer_threshold
+                };
                 let minimizer_threshold: usize = kmer_threshold.div_ceil(window_size);
 
                 let packed_seq = parser.get_packed_seq();
-                let num_kmers = seq_len - kmer_size + 1;
                 mini_pos.clear();
-                super_kmers.clear();
-                let out = mini_builder
-                    .super_kmers(&mut super_kmers)
-                    .run(packed_seq, &mut mini_pos);
-                super_kmers.push(num_kmers as u32);
 
-                matched_sk.clear();
-                let mut possible_kmers: usize = 0;
-                for (min_val, bounds) in out.values_u64().zip(super_kmers.windows(2)) {
-                    if ref_min_dict.contains(&min_val) {
-                        let span = (bounds[1] - bounds[0]) as usize;
-                        possible_kmers += span;
-                        matched_sk.push((min_val, bounds[0] as usize, bounds[1] as usize));
-                    }
-                }
+                let is_match = if is_approx {
+                    let out = mini_builder.run(packed_seq, &mut mini_pos);
+                    ref_min_dict.matches_threshold(out.values_u64(), minimizer_threshold)
+                } else {
+                    super_kmers.clear();
+                    let out = mini_builder
+                        .super_kmers(&mut super_kmers)
+                        .run(packed_seq, &mut mini_pos);
+                    super_kmers.push((seq_len - kmer_size + 1) as u32);
 
-                if matched_sk.len() < minimizer_threshold || possible_kmers < kmer_threshold {
-                    continue;
-                }
-
-                kmer_hashes.clear();
-                hasher
-                    .hash_kmers_simd(packed_seq, 1)
-                    .collect_into(&mut kmer_hashes);
-
-                let mut kmer_match_count = 0;
-                let mut remaining_possible = possible_kmers;
-                for &(min_val, start, end) in &matched_sk {
-                    let span = end - start;
-                    if let Some(page) = ref_kmer_dict.get_page(min_val) {
-                        for &h in &kmer_hashes[start..end] {
-                            if ConcurrentBlockSparseBitSet::page_contains(page, h) {
-                                kmer_match_count += 1;
-                            }
+                    matched_sk.clear();
+                    let mut possible_kmers: usize = 0;
+                    for (min_val, bounds) in out.values_u64().zip(super_kmers.windows(2)) {
+                        if ref_min_dict.contains(&min_val) {
+                            let span = (bounds[1] - bounds[0]) as usize;
+                            possible_kmers += span;
+                            matched_sk.push((min_val, bounds[0] as usize, bounds[1] as usize));
                         }
                     }
-                    remaining_possible -= span;
-                    if kmer_match_count >= kmer_threshold
-                        || kmer_match_count + remaining_possible < kmer_threshold
-                    {
-                        break;
-                    }
-                }
 
-                if kmer_match_count >= kmer_threshold {
+                    if matched_sk.len() < minimizer_threshold || possible_kmers < kmer_threshold {
+                        false
+                    } else {
+                        kmer_hashes.clear();
+                        hasher
+                            .hash_kmers_simd(packed_seq, 1)
+                            .collect_into(&mut kmer_hashes);
+
+                        let mut kmer_match_count = 0;
+                        let mut remaining_possible = possible_kmers;
+                        for &(min_val, start, end) in &matched_sk {
+                            let span = end - start;
+                            if let Some(page) = ref_kmer_dict.get_page(min_val) {
+                                for &h in &kmer_hashes[start..end] {
+                                    if ConcurrentBlockSparseBitSet::page_contains(page, h) {
+                                        kmer_match_count += 1;
+                                    }
+                                }
+                            }
+                            remaining_possible -= span;
+                            if kmer_match_count >= kmer_threshold
+                                || kmer_match_count + remaining_possible < kmer_threshold
+                            {
+                                break;
+                            }
+                        }
+                        kmer_match_count >= kmer_threshold
+                    }
+                };
+
+                if is_match {
                     local_buf.push(b'>');
                     local_buf.extend_from_slice(parser.get_header());
                     local_buf.push(b'\n');

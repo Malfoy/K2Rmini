@@ -53,6 +53,36 @@ impl ShardedHashSet {
     pub fn is_empty(&self) -> bool {
         self.shards.iter().all(|s| s.is_empty())
     }
+
+    /// Checks if the number of matching minimizers reaches `threshold`,
+    /// breaking early as soon as the threshold is met or cannot be met.
+    pub fn matches_threshold(
+        &self,
+        minimizers: impl ExactSizeIterator<Item = u64>,
+        threshold: usize,
+    ) -> bool {
+        if threshold == 0 {
+            return true;
+        }
+        let total = minimizers.len();
+        if total < threshold {
+            return false;
+        }
+        let mut count = 0;
+        let mut remaining = total;
+        for min_val in minimizers {
+            remaining -= 1;
+            if self.contains(&min_val) {
+                count += 1;
+                if count >= threshold {
+                    return true;
+                }
+            } else if count + remaining < threshold {
+                return false;
+            }
+        }
+        count >= threshold
+    }
 }
 
 /// Backwards-compatible alias for minimizer indexing.
@@ -97,7 +127,6 @@ impl ConcurrentShardedSet {
     /// single-probe negative lookups.
     pub fn freeze(self) -> ShardedHashSet {
         let shards = Arc::try_unwrap(self.shards)
-            .ok()
             .expect("All concurrent writers must be dropped before freeze")
             .into_iter()
             .map(|m| {
@@ -126,6 +155,13 @@ impl LocalWriter<'_> {
         buf.push(val);
         if buf.len() >= 512 {
             self.flush_shard(shard);
+        }
+    }
+
+    #[inline(always)]
+    pub fn extend(&mut self, iter: impl Iterator<Item = u64>) {
+        for val in iter {
+            self.insert(val);
         }
     }
 
