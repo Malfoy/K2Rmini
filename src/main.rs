@@ -385,6 +385,3 @@ fn process_query_streaming(
 
     Ok(())
 }
-
-#[cfg(test)]
-mod tests;

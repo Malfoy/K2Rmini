@@ -8,7 +8,7 @@ clap = { version = "4.6", features = ["derive"] }
 crossbeam-channel = "0.5"
 libc = "0.2"
 helicase = { version = "1.1", features = ["packed-seq"] }
-simd-minimizers = "3.0"
+simd-minimizers = "3.1"
 regex = "1.13"
 rustc-hash = "2.1"
 
