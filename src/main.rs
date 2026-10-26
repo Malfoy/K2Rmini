@@ -1,8 +1,8 @@
 use clap::Parser as ClapParser;
 use crossbeam_channel::bounded;
 use helicase::*;
-use packed_seq::Seq;
 use simd_minimizers::minimizers;
+use simd_minimizers::packed_seq::Seq;
 use simd_minimizers::seq_hash::{KmerHasher, NtHasher};
 
 use core::fmt::Display;
@@ -187,24 +187,24 @@ fn index_reference(args: &Args) -> io::Result<(MinIndex, KmerIndex)> {
                 }
 
                 if num_kmers <= BATCH_KMERS {
-                mini_pos.clear();
-                super_kmers.clear();
-                let out = mini_builder
-                    .super_kmers(&mut super_kmers)
-                    .run(packed_seq, &mut mini_pos);
-                super_kmers.push(num_kmers as u32);
+                    mini_pos.clear();
+                    super_kmers.clear();
+                    let out = mini_builder
+                        .super_kmers(&mut super_kmers)
+                        .run(packed_seq, &mut mini_pos);
+                    super_kmers.push(num_kmers as u32);
 
-                kmer_hashes.clear();
-                hasher
-                    .hash_kmers_simd(packed_seq, 1)
-                    .collect_into(&mut kmer_hashes);
+                    kmer_hashes.clear();
+                    hasher
+                        .hash_kmers_simd(packed_seq, 1)
+                        .collect_into(&mut kmer_hashes);
 
-                for (min_val, bounds) in out.values_u64().zip(super_kmers.windows(2)) {
-                    local_mini.insert(min_val);
-                    kmer_dict.insert_batch(
-                        min_val,
-                        &kmer_hashes[bounds[0] as usize..bounds[1] as usize],
-                    );
+                    for (min_val, bounds) in out.values_u64().zip(super_kmers.windows(2)) {
+                        local_mini.insert(min_val);
+                        kmer_dict.insert_batch(
+                            min_val,
+                            &kmer_hashes[bounds[0] as usize..bounds[1] as usize],
+                        );
                     }
                 } else {
                     for k_start in (0..num_kmers).step_by(BATCH_KMERS) {
@@ -385,3 +385,6 @@ fn process_query_streaming(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
