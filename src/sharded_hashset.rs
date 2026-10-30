@@ -49,6 +49,10 @@ impl ShardedHashSet {
         self.shards.iter().map(|s| s.len()).sum()
     }
 
+    pub(crate) fn into_values(self) -> impl Iterator<Item = u64> {
+        self.shards.into_vec().into_iter().flatten()
+    }
+
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.shards.iter().all(|s| s.is_empty())

@@ -3,13 +3,15 @@ name = "K2Rmini"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "k2rmini"
+
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
 crossbeam-channel = "0.5"
 libc = "0.2"
-helicase = { version = "1.1", features = ["packed-seq"] }
+helicase = { version = "1.2", features = ["packed-seq"] }
 simd-minimizers = "3.1"
-regex = "1.13"
 rustc-hash = "2.1"
 
 [profile.release]

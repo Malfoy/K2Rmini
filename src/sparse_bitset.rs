@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 const NUM_PAGES: usize = 65_536;
-const WORDS_PER_PAGE: usize = 1_024; // 1,024 * 64 = 65,536 bits = 8,192 bytes = 8 KB
+pub(crate) const WORDS_PER_PAGE: usize = 1_024; // 1,024 * 64 = 65,536 bits = 8,192 bytes = 8 KB
 
 /// A concurrent block-sparse bitset for 32-bit keys (`u32`).
 ///
@@ -97,6 +97,31 @@ impl ConcurrentBlockSparseBitSet {
         (page[word_idx].load(Ordering::Relaxed) & bit_mask) != 0
     }
 
+    /// Iterates occupied composite addresses after indexing has finished.
+    pub(crate) fn addresses(&self) -> impl Iterator<Item = u32> + '_ {
+        self.pages
+            .iter()
+            .enumerate()
+            .filter_map(|(page_idx, ptr)| {
+                // Pages remain allocated until self is dropped. The returned borrow
+                // cannot outlive self, and words are read atomically.
+                unsafe { ptr.load(Ordering::Acquire).as_ref() }.map(|page| (page_idx, page))
+            })
+            .flat_map(|(page_idx, page)| {
+                page.iter().enumerate().flat_map(move |(word_idx, word)| {
+                    let mut bits = word.load(Ordering::Relaxed);
+                    std::iter::from_fn(move || {
+                        if bits == 0 {
+                            return None;
+                        }
+                        let offset = word_idx * 64 + bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        Some(((page_idx as u32) << 16) | offset as u32)
+                    })
+                })
+            })
+    }
+
     /// Returns the total number of set bits (cardinality).
     pub fn len(&self) -> usize {
         let mut total = 0;
@@ -122,5 +147,31 @@ impl Drop for ConcurrentBlockSparseBitSet {
                 unsafe { drop(Box::from_raw(ptr)) };
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn exported_addresses_preserve_page_and_low_hash_bits() {
+        let index = ConcurrentBlockSparseBitSet::new();
+        let batches: &[(u64, &[u32])] = &[
+            (0, &[0, 63, 64, 65_535, 65_536, u32::MAX]),
+            (1, &[0, 63, 64, 65_535]),
+            (u64::MAX, &[0, 64, u32::MAX]),
+        ];
+        let mut expected = HashSet::new();
+        for &(minimizer, hashes) in batches {
+            index.insert_batch(minimizer, hashes);
+            for &hash in hashes {
+                expected.insert(((minimizer_page(minimizer) as u32) << 16) | (hash & 0xffff));
+            }
+        }
+        let actual: HashSet<_> = index.addresses().collect();
+        assert_eq!(actual, expected);
+        assert_eq!(index.len(), expected.len());
     }
 }
